@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#03060d">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Job Agent</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="stylesheet" href="/ui/panel.css">
+<script src="/ui/panel.js" defer></script>
+</head>
+<body>
+<div id="fx" aria-hidden="true"><div class="grid"></div><div class="sweep"></div><div class="scan"></div><div class="vig"></div></div>
+
+<div id="boot" aria-hidden="true"><pre id="bootlog"></pre></div>
+
+<div id="app">
+  <header id="top">
+    <div class="logo"><b>JOB</b><i>//</i>AGENT</div>
+    <div id="bootline" class="dim"></div>
+    <button id="approval" class="btn sm warn" hidden title="The assistant is waiting for your approval">Approval needed</button>
+    <div id="status"></div>
+    <div id="clock" class="dim"></div>
+    <button id="kbtn" class="key" title="Search (⌘K or /)">Search ⌘K</button>
+  </header>
+
+  <nav id="side" aria-label="Places"></nav>
+
+  <main id="main">
+    <section id="dash" class="screen" aria-label="Home"></section>
+
+    <section id="listpane" class="pane brk">
+      <div class="phead">
+        <div class="ptitle"><h1 id="ltitle"></h1><span id="lcount" class="dim"></span></div>
+        <div id="tabs" role="tablist"></div>
+        <div id="lacts" hidden></div>
+        <label class="filter"><span id="qicon" class="dim"></span><input id="q" type="search" placeholder="Search" aria-label="Search this list" autocomplete="off" spellcheck="false" autocapitalize="off"><kbd class="key">/</kbd></label>
+      </div>
+      <div id="list" role="listbox" tabindex="-1"></div>
+      <div id="hints" class="dim"><span><kbd class="key">↑</kbd><kbd class="key">↓</kbd> move</span><span><kbd class="key">Enter</kbd> open</span><span><kbd class="key">?</kbd> shortcuts</span></div>
+    </section>
+
+    <section id="detail" class="pane brk" aria-live="polite"></section>
+  </main>
+</div>
+
+<div id="help" class="overlay" hidden></div>
+<div id="toast" role="status"></div>
+<div id="reticle" aria-hidden="true"><i></i><i></i><i></i><i></i><b></b></div>
+</body>
+</html>

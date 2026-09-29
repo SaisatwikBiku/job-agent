@@ -1,0 +1,6 @@
+ollama
+fastapi
+uvicorn
+pywebpush
+pypdf
+reportlab
