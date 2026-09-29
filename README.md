@@ -1,5 +1,7 @@
 # Job Agent
 
+Note: This is just a showcase code and it shows snapshot of Sep 29,2026 Code and might not reflect later changes. Active repository is hidden so that deployments to the server stays secured.
+
 A self-hosted AI assistant for the job search, running on a spare laptop with no cloud model and no API keys. Every night it reads around 13,000 postings from about 140 company career boards, scores each one against my resume, and prepares the applications worth sending: answers to every form question, a tailored resume and a cover letter. In the morning I review them in a web panel on my phone or laptop and approve or skip each one. Only the ones I approve are sent, by a browser script that fills the real form while I watch.
 
 It also reads a dedicated inbox to track replies, keeps a timeline for every application, writes a weekly report on what's working, and includes a general assistant that can run commands on the server, each one only after I approve it.
