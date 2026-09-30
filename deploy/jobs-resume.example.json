@@ -37,6 +37,14 @@
    "bullets": [
     "What you did and how. Bullets are used word for word."
    ]
+  },
+  {
+   "name": "Project to show on every resume",
+   "subtitle": "What it is (stack)",
+   "always": true,
+   "bullets": [
+    "\"always\": true keeps a project on every tailored resume, listed first. Add new projects at the end."
+   ]
   }
  ],
  "experience": [

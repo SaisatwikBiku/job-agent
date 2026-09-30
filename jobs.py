@@ -18,6 +18,7 @@ Files in JOBS_DIR (default /home/agentd/jobs, which the agent user can't read):
     mail.json     the agent inbox's address and app password (set from the panel)
     inbox.json    emails read from that inbox
 """
+import hashlib
 import html
 import json
 import os
@@ -1293,6 +1294,8 @@ def _run(is_busy):
             db["jobs"].setdefault(j["id"], j)
     update_db(store)
 
+    refresh_matches()  # jobs scored against an older resume
+
     # 2. Score each candidate. The system prompt is the same for every posting, so
     #    Ollama's prefix cache covers it.
     resume_norm = skill_text(resume)
@@ -1833,7 +1836,56 @@ SUMMARY_KEYS = ("id", "company", "title", "location", "url", "posted", "status",
                 "level", "has_skills", "missing_skills", "no_sponsorship", "sponsors", "years", "found")
 
 
+def resume_stamp():
+    return hashlib.sha256(b"".join(p.read_bytes() if p.exists() else b"-" for p in (JOBS_DIR / "resume.txt", RESUME_JSON))).hexdigest()[:16]
+
+
+def refresh_matches():
+    """When the resume changes, check every job against it again. Which skills a job
+    asks for comes from the model and stays; which of them the resume has, the score,
+    and the cover-letter warning about skills the resume doesn't list are worked out in
+    code, so they're redone for all jobs at once with no model time. Without this, a
+    skill added to the resume showed as missing on jobs scored before (2026-09-30)."""
+    now = resume_stamp()
+    with db_lock:
+        if load_db()["meta"].get("resume_stamp") == now:
+            return 0
+    txt = JOBS_DIR / "resume.txt"
+    if not txt.exists():
+        return 0
+    resume_norm = skill_text(txt.read_text())
+    r = load_resume()
+    docs_norm = skill_text(resume_as_text(r)) if r else resume_norm  # tailoring checks against resume.json
+
+    def change(db):
+        n = 0
+        for j in db["jobs"].values():
+            skills = (j.get("has_skills") or []) + (j.get("missing_skills") or [])
+            if j.get("score") is not None and skills:
+                has, missing = compare_skills(skills, resume_norm)
+                score = fit_score(has, missing, j.get("level"), j.get("years"), j.get("no_sponsorship"))
+                if (has, missing, score) != (j.get("has_skills"), j.get("missing_skills"), j.get("score")):
+                    j.update(has_skills=has, missing_skills=missing, score=score)
+                    n += 1
+            d = j.get("docs")
+            if d and d.get("cover"):
+                extra = unsupported(d["cover"], j, docs_norm)
+                warnings = [w for w in d.get("warnings") or [] if not w.startswith("The cover letter mentions")]
+                if extra:
+                    warnings.append("The cover letter mentions " + ", ".join(extra) + ", which your resume doesn't list.")
+                if warnings != (d.get("warnings") or []):
+                    d["warnings"] = warnings
+                    n += 1
+        db["meta"]["resume_stamp"] = now
+        return n
+    changed = update_db(change)
+    if changed:
+        print(f"resume changed: {changed} jobs re-checked", flush=True)
+    return changed
+
+
 def summary():
+    refresh_matches()
     cfg = load_config()
     with db_lock:
         db = load_db()
@@ -2125,7 +2177,9 @@ def work_history():
 
 # ---------- tailored resume and cover letter ----------
 # resume.json holds Sai's resume as data (deploy/jobs-resume.example.json). For each
-# job the code picks and orders projects and skills by the job's required skills, and
+# job the code picks and orders projects and skills by the job's required skills (a
+# project with "always": true is always picked, first; add new projects at the end of the
+# list, since tailored resumes store project positions), and
 # the model only rewrites the summary (checked against the resume) and drafts the
 # cover letter. Bullets are never rewritten. The PDFs are rendered from this data each
 # time they're opened, so edits in the panel show up at once.
@@ -2209,8 +2263,9 @@ def tailor(job, r, is_busy, model):
     """The per-job choices for the resume and the cover letter text."""
     words = job_skill_words(job)
     projects = r.get("projects", [])
-    order = sorted(range(len(projects)), key=lambda i: -relevance(
-        " ".join([projects[i]["name"], projects[i].get("subtitle", "")] + projects[i].get("bullets", [])), words))
+    # projects marked "always" come first, then the rest by how much of the job they cover
+    order = sorted(range(len(projects)), key=lambda i: (not projects[i].get("always"), -relevance(
+        " ".join([projects[i]["name"], projects[i].get("subtitle", "")] + projects[i].get("bullets", [])), words)))
     skills = {g["group"]: sorted(g["items"], key=lambda s: -relevance(s, words)) for g in r.get("skills", [])}
     text, resume_norm = resume_as_text(r), skill_text(resume_as_text(r))
     facts = (f"Job: {job['title']} at {job['company']}\nWhat the job asks for: "
@@ -2327,9 +2382,11 @@ def render_resume(r, docs, profile):
         items = order.get(g["group"]) if sorted(order.get(g["group"]) or []) == sorted(g["items"]) else g["items"]
         story.append(Paragraph(f"<b>{pdf_text(g['group'])}:</b> {pdf_text(', '.join(items))}", st["bullet"], bulletText="•"))
     projects = r.get("projects", [])
-    picked = [projects[i] for i in docs.get("projects") or [] if isinstance(i, int) and 0 <= i < len(projects)]
+    picked = [projects[i] for i in docs.get("projects") or [] if isinstance(i, int) and 0 <= i < len(projects)] or projects[:MAX_PROJECTS]
+    # "always" projects lead every resume, including ones tailored before they were added
+    picked = ([p for p in projects if p.get("always")] + [p for p in picked if not p.get("always")])[:MAX_PROJECTS]
     head("Relevant projects")
-    for p in picked or projects[:MAX_PROJECTS]:
+    for p in picked:
         sub = f" &nbsp;|&nbsp; <font name='Helvetica'>{pdf_text(p['subtitle'])}</font>" if p.get("subtitle") else ""
         story.append(Paragraph(f"{pdf_text(p['name'])}{sub}", st["item"]))
         story += [Paragraph(pdf_text(b), st["bullet"], bulletText="•") for b in p.get("bullets", [])]
