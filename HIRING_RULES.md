@@ -29,8 +29,8 @@ Each rule's action can be changed under You, Rules in the panel. The settings ar
 |---|---|---|
 | Same posting twice (`already_applied`) | Block | The job is already applied, interviewing, rejected or withdrawn. |
 | Reposted opening (`repost`) | Ask | Another job at the company has the same title and location, and I approved, applied, interviewed or was rejected for it in the last 60 days. |
-| Applied there before (`applied_before`) | Ask | I already have an application at the company: approved and not sent yet, applied, interviewing, rejected or withdrawn, at any time. Applications made outside the agent count when I mark them Applied, when the inbox sees the confirmation, or when the company is on my profile's list of companies applied or interviewed at. The message names the earlier applications and their status. |
-| Company application cap (`company_cap`) | Block | I already have the cap's number of approved, applied or interviewing jobs at the company within its window. A limit the company states itself wins: Ashby postings carry one (OpenAI: "Candidates may not apply more than 5 times in any 180 day span"), and the agent also reads phrases like "no more than three roles within a 6 month period" in postings. Otherwise: 3 in 30 days by default, Google 3 in 90 days, and any company caps set under You, Rules. |
+| Applied there before (`applied_before`) | Warn | I already have an application at the company: approved and not sent yet, applied, interviewing, rejected or withdrawn, at any time. Applications made outside the agent count when I mark them Applied, when the inbox sees the confirmation, or when the company is on my profile's list of companies applied or interviewed at. The message names the earlier applications and their status. |
+| Company application cap (`company_cap`) | Block | I already have the cap's number of applications at the company within its window, counted from when each went out; a rejection or withdrawal doesn't free a slot. The job waits in Jobs › Later and comes back to review when the oldest application ages out. A limit the company states itself wins: Ashby postings carry one (OpenAI: "Candidates may not apply more than 5 times in any 180 day span"), and the agent also reads phrases like "no more than three roles within a 6 month period" in postings. Otherwise: 3 in 30 days by default, Google 3 in 90 days, and any company caps set under You, Rules. |
 | Unrelated roles at one company (`role_spread`) | Ask | This job would make more than 2 kinds of role active at the company. Kinds are read from the title: database, data, ML, infrastructure, or software for everything else. |
 | Pace per company (`same_day`) | Warn | Two or more applications to the company were approved or sent today. |
 | Pace per application system (`ats_daily`) | Warn | 25 or more applications went out today on the same system (Greenhouse, Lever or Ashby). Bursts from one email can get flagged as automated. |
@@ -61,7 +61,8 @@ A company's application system keeps all my applications on one candidate record
 | Rule | Default | Breaks when |
 |---|---|---|
 | Different answers to one company (`consistency`) | Ask | My answer on salary, start date, relocation, sponsorship, working on-site or work authorization differs from the one on another approved, applied or interviewing application at the company. |
-| Different resumes to one company (`resume_consistency`) | Warn | Another application at the company in the last 60 days used a tailored resume with a different summary or different projects. |
+| Same role twice (`same_role`) | Block | I applied for a job with the same title at the company within its cap window: the cap is for different roles. It comes back when that application ages out. |
+| Different resumes to one company (`resume_consistency`) | Block | The tailored resume (summary and projects) matches none of the ones the company got in the last 60 days. The agent gives a company's other jobs the resume it already got (only the cover letter differs), so this catches only what it couldn't line up. |
 
 ### Company policies and conflicts
 
@@ -73,7 +74,7 @@ A company's application system keeps all my applications on one candidate record
 
 ## Staffing agencies
 
-For jobs from TEKsystems, Apex Systems, Randstad and Insight Global, the employer is the agency's client, usually unnamed, so the company rules (applied there before, company caps, unrelated roles, pace per company, interviewing or withdrawn there, cooldowns, different answers or resumes) don't count an agency's postings as one company. Reposts within one agency and every eligibility rule still apply.
+For jobs from TEKsystems, Apex Systems, Randstad and Insight Global, the employer is the agency's client, usually unnamed, so the company rules (applied there before, company caps, same role twice, unrelated roles, pace per company, interviewing or withdrawn there, cooldowns, different answers or resumes) don't count an agency's postings as one company. Reposts within one agency and every eligibility rule still apply.
 
 ## Already handled elsewhere
 
@@ -96,5 +97,7 @@ Under You, Rules:
 - Big tech companies commonly enforce 6 to 12 month cooldowns after interview rejections, with little or none after resume screens ([Leon Consulting](https://leonstaff.com/blogs/big-tech-interview-cooldown-periods-guide/), [Apt](https://www.tryapt.ai/blog/when-to-reapply-after-job-rejection)).
 - Anthropic asked applicants not to use AI assistants in applications, and later changed its policy; its forms still include an AI policy question ([Fortune](https://fortune.com/2025/02/04/anthropic-tells-job-candidates-dont-use-ai-employer-trend), [Inc.](https://www.inc.com/chris-morris/why-anthropic-changed-policy-banning-ai-job-applicants/91219358)).
 - The graduation window came from Scale AI's form, which asks applicants to confirm a Fall 2026 or Spring 2027 graduation.
+
+Applications I send myself, outside the agent, count too: the agent tracks them from their emails in its inbox (confirmations, rejections, interviews), so company caps, cooldowns and "applied before" see them.
 
 Companies change these policies. When a company states its own rule, add it as a company cap or change the rule's action.

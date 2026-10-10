@@ -1,6 +1,6 @@
 # Job Agent
 
-Note: This is just a showcase code and it shows snapshot of Sep 30,2026 Code and might not reflect later changes. Active repository is hidden so that deployments to the server stays secured.
+Note: This is just a showcase code and it shows snapshot of Oct 10, 2026 code and might not reflect later changes. Active repository is hidden so that deployments to the server stays secured.
 
 A self-hosted AI assistant for the job search, running on a spare laptop with no cloud model and no API keys. Every night it reads around 13,000 postings from about 140 company career boards, scores each one against my resume, and prepares the applications worth sending: answers to every form question, a tailored resume and a cover letter. In the morning I review them in a web panel on my phone or laptop and approve or skip each one. Only the ones I approve are sent, by a browser script that fills the real form while I watch.
 
@@ -14,10 +14,13 @@ The data in every screenshot is made up for this showcase: the companies, jobs, 
 
 - Finds jobs. `jobs.py` reads the public job board APIs of Greenhouse, Lever, Ashby, Workday and SmartRecruiters for a configured list of companies, discovers more companies through a local search engine, and reads four staffing agencies' listings. Titles, locations, experience and visa sponsorship are filtered in code before any model time is spent.
 - Scores and prepares them. The local 4B model reads each posting and extracts its required skills and level into a fixed JSON schema; the score itself is computed in code from how many of those skills the resume has, the level and the years asked for, so it's consistent and explainable. The 8B model then drafts answers to the application's own questions. Facts come from a profile I fill in once (work authorization, education, links); only open-ended questions are drafted by the model, and they're marked for checking.
-- Tailors documents. For each job it reorders my projects and skills by what the posting asks for, rewrites the resume summary without touching the bullets, drafts a cover letter, and flags any claim the resume doesn't support.
+- Tailors documents. For each job it reorders my projects and skills by what the posting asks for and keeps the resume to two pages (four bullets per job, three projects), in my own words. Applicant tracking systems match words as written, so an "Additional" skills line adds the posting's exact terms for skills the resume already shows in other words ("RESTful APIs" when it says "REST APIs"); it never adds a skill I don't have. It drafts a cover letter that's told which skills not to claim, flags any claim the resume doesn't support, and gives every application to one company the same resume.
 - Checks hiring rules before anything is sent: duplicates, company application caps, reapplying too soon after a rejection, graduation windows, AI-use policies (see [HIRING_RULES.md](HIRING_RULES.md)).
 - Submits with a human in the loop. A userscript fills Greenhouse, Lever, Ashby and Workday forms in my own browser, only for applications I approved, and records exactly what was sent.
 - Follows up. It reads the applications inbox over IMAP (read-only), recognizes confirmations, assessments, interview requests, rejections and sign-in codes, and moves each application along. Deadlines show as live countdowns.
+- Auto mode. It learns from my own approve and skip decisions which kinds of job I always pass on and skips them for me, holds jobs past my company cap (three roles in 30 days) until they can go out, and pushes a to-do list at 6 p.m. of what only I can do. It never approves, submits or sends anything.
+- Tracks applications I send myself. Confirmations, rejections and interview emails for applications sent outside the agent become tracked applications too, so the hiring rules and the weekly report count them.
+- Looks after the machine. A heat guard pauses model work if the CPU stays at 90°C for a full minute and carries on below 70°C, a Cool down button pauses it for an hour, and charger, battery, disk and downtime alerts go to my phone. It started with [an overheating alert on a hike](https://satwik.info/work/job-agent/incident).
 - Reports. A weekly report counts what the search found, which kinds of jobs fit, which missing skills would widen the matches most, and reply rates by match strength. No model writes it; every suggestion shows the numbers it rests on.
 
 ## Engineering decisions
@@ -79,6 +82,14 @@ The inbox, sorted by the local model, with a live deadline countdown; and the as
 ![Inbox](docs/screenshots/inbox.png)
 
 ![Assistant](docs/screenshots/assistant.png)
+
+Auto mode: what it learned from my decisions and the patterns it skips on its own, with the company rule and one resume per company.
+
+![Auto mode](docs/screenshots/auto.png)
+
+The nightly search card, with the CPU temperature and the Cool down button.
+
+![Nightly search and CPU temperature](docs/screenshots/heat.png)
 
 On a phone, the same app stacks: a bottom tab bar, and each job opens full screen with Approve and Skip at the bottom (or a swipe).
 
@@ -193,6 +204,12 @@ deploy/
   agent-update.timer          triggers it every 5 minutes
   jobs-config.example.json    job search settings: roles, companies, filters, schedule
   jobs-profile.example.json   fields for application forms (the real file stays on the server)
+  jobs-resume.example.json    the resume as data, for tailored resumes and cover letters
+  power-limit.sh/.service/.timer   caps the CPU's 30-second turbo bursts at 25 W
+  power-key.conf              a short press of the power button does nothing; hold to power off
+  battery-limit.sh/.service/.timer keeps the battery between 75% and 80% on the charger
+  battery-limit-hold.service  pauses charging at shutdown, so a switched-off laptop can't charge to 100%
+  apt-upgrade-time.conf       installs updates in the afternoon, away from the nightly search
 ```
 
 ## Setup
@@ -398,9 +415,11 @@ A few things this particular laptop needed, which may save time on similar hardw
 - Closing the lid suspends the machine by default. A logind drop-in with `HandleLidSwitch=ignore` and masking the sleep targets keeps it running.
 - Lenovo's airplane-mode setting survived the switch from Windows and left the Wi-Fi radio soft-blocked (`ideapad_wlan` in `/sys/class/rfkill`). Writing `0` to the `soft` files cleared it.
 - Intel Wi-Fi power saving made SSH sessions sluggish. `deploy/wifi-powersave-off.service` turns it off at boot.
-- Lenovo's battery conservation mode, at `/sys/bus/platform/drivers/ideapad_acpi/VPC2004:00/conservation_mode`, caps charging to protect a battery that stays plugged in.
+- Lenovo's firmware has no charge threshold, only conservation mode (`charge_types` Long_Life on newer kernels). `deploy/battery-limit.sh` turns it on at 80% and off at 75% every minute, and `battery-limit-hold.service` turns it on at shutdown: the firmware keeps the mode while the laptop is off, and one night with it off the switched-off laptop charged to 100%.
+- On a laptop the power button means "off". Pressing it to wake a blanked screen shut the server down once, so `deploy/power-key.conf` makes a short press do nothing.
+- The i3's firmware allows 51-55 W turbo bursts for about 30 seconds, and a long model prompt uses all of it: 38°C to 88°C in 28 seconds in a controlled test. `deploy/power-limit.sh` caps bursts at 25 W, though a retest still peaked at 88°C; the heat guard is the real protection.
 - With `OLLAMA_KEEP_ALIVE=-1`, every model loaded during benchmarking stayed in memory until 11 GB of 16 were in use. `OLLAMA_MAX_LOADED_MODELS=1` prevents that.
-- Unattended upgrades with an automatic 4 a.m. reboot keep kernel security fixes applied.
+- Unattended upgrades keep security fixes applied. They used to run inside the nightly search, and one restarted the panel mid-run, so `deploy/apt-upgrade-time.conf` moves them to the afternoon, and an interrupted search picks up where it stopped.
 
 ## Limitations
 

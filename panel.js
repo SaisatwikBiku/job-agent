@@ -60,11 +60,13 @@ function tickOne(e){ const [t, c] = tminus(+e.dataset.due - Date.now()); e.textC
 // Each list is kept in this browser too, so the panel paints at once from the last known
 // state and the live one replaces it a moment later. The server answers unchanged lists
 // with a 304, so polling costs next to nothing.
-const D = {jobs: null, apps: null, inbox: null, report: null};
-const SRC = {jobs: ["/api/jobs", 8000], apps: ["/api/applications", 30000], inbox: ["/api/inbox", 20000], report: ["/api/report", 600000]};
+const D = {jobs: null, apps: null, inbox: null, report: null, auto: null, autofill: null};
+const SRC = {jobs: ["/api/jobs", 8000], apps: ["/api/applications", 30000], inbox: ["/api/inbox", 20000], report: ["/api/report", 600000], auto: ["/api/auto", 30000],
+             autofill: ["/api/autofill", 4000]};
 const RAW = {};
 let JOB = new Map(), linkOk = true, linkErr = "";
 for (const k in SRC) {
+  if (k === "autofill") continue;  // a run in progress is only shown live, never from the cache
   const raw = store("v2:" + k);
   if (raw) try { D[k] = JSON.parse(raw); RAW[k] = raw; } catch (e) {}
 }
@@ -77,7 +79,7 @@ async function load(k){
     const raw = await r.text();
     linkOk = true; linkErr = "";
     if (raw === RAW[k]) { drawStatus(); return; }
-    RAW[k] = raw; D[k] = JSON.parse(raw); store("v2:" + k, raw);
+    RAW[k] = raw; D[k] = JSON.parse(raw); if (k !== "autofill") store("v2:" + k, raw);
     if (k === "jobs") indexJobs();
     render();
   } catch (e) {
@@ -96,7 +98,8 @@ const refresh = (...ks) => { for (const k of ks) poll(k); };
 // ---------- vocabulary ----------
 const MAIL = {assessment: ["warn", "Assessment"], assessment_done: ["good", "Assessment done"], interview: ["good", "Interview request"],
   scheduled: ["good", "Interview scheduled"], offer: ["good", "Offer"], action: ["warn", "Action needed"], outreach: ["", "Recruiter"],
-  rejection: ["bad", "Rejection"], confirmation: ["mute", "Confirmation"], verification: ["warn", "Sign-in code"], other: ["mute", "Other"]};
+  rejection: ["bad", "Rejection"], confirmation: ["mute", "Confirmation"], incomplete: ["warn", "Unfinished application"], verification: ["warn", "Sign-in code"], other: ["mute", "Other"],
+  posting: ["", "On the posting"]};
 const STATUS = {new: ["", "Open"], approved: ["", "Approved"], applied: ["good", "Applied"], interview: ["good", "Interview"],
   offer: ["good", "Offer"], rejected: ["bad", "Rejected"], withdrew: ["mute", "Withdrawn"], skipped: ["mute", "Skipped"]};
 const chip = (tone, text) => el("span", "chip " + (tone || ""), text);
@@ -151,8 +154,9 @@ const PLACES = [
   {id: "jobs", label: "Jobs", key: "j", find: "Search jobs"},
   {id: "apps", label: "Applications", short: "Applied", key: "a", find: "Search applications"},
   {id: "inbox", label: "Inbox", key: "i", find: "Search emails"},
-  {id: "agencies", label: "Agencies", key: "e", find: "Search agency jobs"},
+  {id: "agencies", label: "Apply by hand", short: "By hand", key: "e", find: "Search jobs to apply to by hand"},
   {id: "insights", label: "Insights", key: "r", more: true},
+  {id: "explore", label: "Explore", key: "x", more: true},
   {id: "assistant", label: "Assistant", key: "c", more: true},
   {id: "settings", label: "Settings", key: "s", more: true},
 ];
@@ -167,6 +171,7 @@ const ICONS = {
   inbox: "M3 13l3-8h12l3 8v7H3zM3 13h5l1.5 2.5h5L16 13h5",
   agencies: "M4 21V4h10v17M14 9h6v12M7 8h4M7 12h4M7 16h4M2 21h20",
   insights: "M4 20V11M10 20V5M16 20v-6M2 20h20",
+  explore: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM15.5 8.5l-2 5-5 2 2-5z",
   assistant: "M4 4h16v12H10l-6 4z M8 9h8M8 12h5",
   settings: "M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1M15 4v4M9 10v4M17 16v4",
   more: "M5 12h.01M12 12h.01M19 12h.01",
@@ -226,41 +231,69 @@ function drawNav(){
 // ---------- lists ----------
 // Each list place: its tabs, the items in a tab (two-line rows), and how one item is shown.
 function jobItem(j, extra){
-  const f0 = (j.flags || [])[0];
+  const f0 = (j.flags || [])[0], back = heldUntil(j);
+  const tag = isClosed(j) ? "posting closed" : back ? "back " + day(back) : j.auto ? "skipped by Auto mode" : f0 && f0.action === "block" ? "blocked: " + f0.title.toLowerCase() : j.like >= LIKELY ? "your kind of job" : "";
+  const age = j.posted ? "posted " + ago(j.posted) : ago(j.found);
   return {id: j.id, obj: j, kind: "job", t: j.title, r: scoreSpan(j.score),
-    m: [f0 && f0.action === "block" ? "blocked: " + f0.title.toLowerCase() : "", j.company, j.location, extra || ago(j.found)].filter(Boolean).join("  \u00b7  "),
+    m: [tag, j.company, j.location, extra, age].filter(Boolean).join("  \u00b7  "),
     hay: [j.title, j.company, j.location, j.summary, (j.has_skills || []).join(" "), j.level].join(" "),
     sig: j.status + j.prepared + j.docs + (j.flags || []).map(f => f.rule + f.action).join()};
 }
 const byIds = ids => (ids || []).map(id => JOB.get(id)).filter(Boolean);
+// Jobs the autofill can fill live in Jobs; agency and state jobs, and the boards it can't
+// fill (SmartRecruiters, added links), in Apply by hand, with their documents ready.
+const AUTO_SOURCES = ["greenhouse", "lever", "ashby", "workday"];
+const SOURCE_NAME = {smartrecruiters: "SmartRecruiters", custom: "Added link"};
+const byHand = j => !AUTO_SOURCES.includes(j.id.split(":")[0]);
+const sourceOf = j => j.agency || SOURCE_NAME[j.id.split(":")[0]] || "";
+const isClosed = j => j.closed && ["new", "approved"].includes(j.status);
+// Auto mode: how likely Sai is to apply (the server's guess from his own decisions), and
+// jobs held by the company cap, which come back to review by themselves.
+const LIKELY = 50;
+const HOLD_RULES = ["company_cap", "same_role"];
+function heldUntil(j){
+  const blocks = (j.flags || []).filter(f => f.action === "block");
+  if (j.status !== "new" || !blocks.length || !blocks.every(f => HOLD_RULES.includes(f.rule))) return "";
+  return blocks.map(f => f.until || "").sort().pop();
+}
+const byLike = list => D.jobs && D.jobs.auto_on ? list.slice().sort((a, b) => (b.like || 0) - (a.like || 0)) : list;
 const LISTS = {
   jobs: {
     title: "Jobs",
-    tabs: [["awaiting", "To review"], ["open", "Open"], ["accepted", "Approved"], ["declined", "Skipped"]],
+    tabs: [["awaiting", "To review"], ["added", "Added"], ["open", "Open"], ["later", "Later"], ["accepted", "Approved"], ["declined", "Skipped"], ["auto", "Auto-skipped"], ["closed", "Closed"]],
     items(tab){
       const s = D.jobs; if (!s) return null;
-      const all = s.jobs.filter(j => !j.agency);
-      const list = tab === "awaiting" ? byIds(s.review) : tab === "open" ? all.filter(j => j.status === "new")
-        : tab === "accepted" ? all.filter(j => j.status === "approved") : all.filter(j => j.status === "skipped");
+      if (tab === "added") return addedItems(s);
+      const all = s.jobs.filter(j => !byHand(j));
+      if (tab === "closed") return s.jobs.filter(isClosed).map(j => jobItem(j, byHand(j) ? sourceOf(j) : ""));
+      if (tab === "later") return all.filter(j => heldUntil(j) && (j.score || 0) >= s.good).sort((a, b) => heldUntil(a) < heldUntil(b) ? -1 : 1).map(j => jobItem(j));
+      const list = tab === "awaiting" ? byLike(byIds(s.review)) : tab === "open" ? all.filter(j => j.status === "new" && !isClosed(j))
+        : tab === "accepted" ? all.filter(j => j.status === "approved") : tab === "auto" ? s.jobs.filter(j => j.status === "skipped" && j.auto)
+        : all.filter(j => j.status === "skipped");
       return list.map(j => jobItem(j));
     },
-    empty: {awaiting: ["Nothing to review", "New applications are prepared overnight."], open: ["No open jobs", ""],
-            accepted: ["Nothing approved", "Approved applications wait here until the autofill sends them."], declined: ["Nothing skipped", ""]},
+    empty: {awaiting: ["Nothing to review", "New applications are prepared overnight."], added: ["No jobs added yet", "Tap \u201c+ Add a job\u201d (or press n) and paste a job's link."], open: ["No open jobs", ""],
+            closed: ["No closed postings", "Open and approved jobs whose posting its company took down show here. Greenhouse, Lever and Ashby are checked every night."],
+            later: ["Nothing waiting", "Jobs at a company that already has 3 of your applications from the last 30 days wait here, and come back to review when the oldest one ages out."],
+            accepted: ["Nothing approved", "Approved applications wait here until the autofill sends them."], declined: ["Nothing skipped", ""],
+            auto: ["Nothing auto-skipped", "With Auto mode on, jobs you'd skip land here instead of in review. Move one back to open and it's never skipped again."]},
     detail: jobDetail, actions: jobActions,
   },
   apps: {
     title: "Applications",
-    tabs: [["active", "Active"], ["interview", "Interviews"], ["all", "All"], ["closed", "Rejected"]],
+    tabs: [["active", "Active"], ["reach", "Reach out"], ["interview", "Interviews"], ["all", "All"], ["closed", "Rejected"]],
     items(tab){
       const a = D.apps; if (!a) return null;
       const list = a.applications.filter(x => tab === "all" ? true : tab === "interview" ? ["interview", "offer"].includes(x.status)
-        : tab === "closed" ? ["rejected", "withdrew"].includes(x.status) : ["applied", "interview", "offer", "approved"].includes(x.status));
+        : tab === "closed" ? ["rejected", "withdrew"].includes(x.status) : tab === "reach" ? needsReach(x)
+        : ["applied", "interview", "offer", "approved"].includes(x.status));
       return list.map(x => ({id: x.id, obj: x, kind: "app", t: x.company + "  \u2014  " + x.title, r: statusChip(x.status),
-        m: [x.applied_at ? "applied " + day(x.applied_at) : "approved " + day(x.approved_at), x.last_email ? (MAIL[x.last_email.kind] || ["", x.last_email.kind])[1].toLowerCase() + " " + ago(x.last_email.date) : "no reply yet"].join("  \u00b7  "),
-        hay: [x.company, x.title, x.location, x.status, x.agency].join(" "), done: ["rejected", "withdrew"].includes(x.status), fresh: appUpdate(x) > appsMarkSince,
-        sig: x.status + x.status_at + x.emails + (appUpdate(x) > appsMarkSince)}));
+        m: [x.outside ? "outside the agent" : "", x.applied_at ? "applied " + day(x.applied_at) : "approved " + day(x.approved_at), x.last_email ? (MAIL[x.last_email.kind] || ["", x.last_email.kind])[1].toLowerCase() + " " + ago(x.last_email.date) : "no reply yet",
+            ["applied", "interview", "offer"].includes(x.status) ? "contacted " + (x.reached || 0) + " of 4" : ""].filter(Boolean).join("  \u00b7  "),
+        hay: [x.company, x.title, x.location, x.status, x.agency, x.outside ? "outside" : ""].join(" "), done: ["rejected", "withdrew"].includes(x.status), fresh: appUpdate(x) > appsMarkSince,
+        sig: x.status + x.status_at + x.emails + (appUpdate(x) > appsMarkSince) + x.reached}));
     },
-    empty: {active: ["No applications yet", "Applications you send appear here."], interview: ["No interviews yet", ""], all: ["No applications yet", ""], closed: ["No rejections", ""]},
+    empty: {reach: ["Everyone's been contacted", "Applications from the last 3 weeks that still have someone to reach out to show here."], active: ["No applications yet", "Applications you send appear here."], interview: ["No interviews yet", ""], all: ["No applications yet", ""], closed: ["No rejections", ""]},
     detail: appDetail, actions: appActions,
   },
   inbox: {
@@ -281,15 +314,15 @@ const LISTS = {
     detail: mailDetail, actions: inboxActions,
   },
   agencies: {
-    title: "Agencies",
+    title: "Apply by hand",
     tabs: [["ready", "Ready"], ["open", "Open"], ["applied", "Applied"]],
     items(tab){
       const s = D.jobs; if (!s) return null;
-      const all = s.jobs.filter(j => j.agency);
-      const list = tab === "ready" ? byIds(s.agency_ready) : tab === "open" ? all.filter(j => j.status === "new") : all.filter(j => ["applied", "interview", "offer"].includes(j.status));
-      return list.map(j => jobItem(j, j.agency));
+      const all = s.jobs.filter(byHand);
+      const list = tab === "ready" ? byIds(s.agency_ready) : tab === "open" ? all.filter(j => j.status === "new" && !isClosed(j)) : all.filter(j => ["applied", "interview", "offer"].includes(j.status));
+      return list.map(j => jobItem(j, sourceOf(j)));
     },
-    empty: {ready: ["No agency jobs ready", "Resume and cover letter are prepared before one shows here."], open: ["Nothing open", ""], applied: ["Nothing applied", ""]},
+    empty: {ready: ["Nothing to apply to by hand", "Agency and state jobs, and good matches on boards the autofill can't fill, show here once their resume and cover letter are ready."], open: ["Nothing open", ""], applied: ["Nothing applied", ""]},
     detail: jobDetail, actions: agencyActions,
   },
 };
@@ -422,7 +455,7 @@ function drawDetail(force){
   const top = el("div", "dtop"), back = button("\u2039 Back", closeDetail, "back");
   top.append(back, el("span", null, detailLabel(it) + " " + (i + 1) + " of " + items.length));
   box.append(top);
-  LISTS[place].detail(it.obj, box);
+  (it.kind === "adding" ? addingDetail : LISTS[place].detail)(it.obj, box);
 }
 function detailLabel(it){ return it.kind === "mail" ? "Email" : it.kind === "app" ? "Application" : "Job"; }
 function openDetail(){ $("main").classList.add("open"); }
@@ -465,6 +498,9 @@ function jobDetail(j, box){
     for (const s of miss) c.append(chip("warn", "\u2212 " + s));
     box.append(c);
   }
+  if (isClosed(j)) box.append(note("The company's board stopped listing this posting on " + day(j.closed) + ", so it has probably closed. It's out of review; open the link to check.", "warn"));
+  const back = heldUntil(j);
+  if (back) box.append(note("Waiting for the company cap: at most 3 different roles per company in 30 days. It comes back to review on " + day(back) + " if it's still open.", "warn"));
   if ((j.flags || []).length) {
     box.append(sect("Hiring rules"));
     for (const f of j.flags) {
@@ -480,9 +516,22 @@ function jobDetail(j, box){
   getDetail(id).then(full => {
     if (!more.isConnected) return;
     more.remove();
+    autoNote(full, box);
     jobFull(full, box);
     prefetchNext(id);
   }, e => { more.textContent = "Couldn't load the rest: " + e.message; });
+}
+function autoNote(j, box){
+  const a = j.auto_skipped, k = j.like;
+  if (a) {
+    const n = note("Auto mode skipped this. " + (a.why || []).join(" ") + " Move it back to open and Auto mode won't skip it again; it learns from that too.", "warn");
+    box.append(n);
+  } else if (k) {
+    const d = el("div", "note " + (k.p >= LIKELY ? "good" : ""));
+    d.append(el("b", null, k.p >= LIKELY ? "Looks like your kind of job (" + k.p + "%)" : "Not your usual pick (" + k.p + "%)"));
+    if ((k.why || []).length) d.append(el("div", "dim small", k.why.join(" ")));
+    box.append(d);
+  }
 }
 const NEXT_STATUS = {
   new: [["skipped", "Skip", "Skipped"], ["applied", "Mark applied", "Marked applied"]],
@@ -497,7 +546,8 @@ function jobFull(j, box){
   const reviewable = j.answers && j.status === "new" && j.auto_apply;
   const acts = el("div", "acts");
   const url = safeUrl(j.apply_url) || safeUrl(j.url);
-  if (url) acts.append(link(url, j.agency ? "Apply on the agency site" : "Open application", "o"));
+  const state = j.id.startsWith("agency:statejobs:");
+  if (url) acts.append(link(url, state ? "Open the vacancy" : j.agency ? "Apply on the agency site" : "Open application", "o"));
   for (const [st, label, msg] of NEXT_STATUS[j.status] || []) {
     if (reviewable && st === "skipped") continue;  // Skip sits next to Approve below
     acts.append(button(label, () => setJobStatus(j.id, st, msg)));
@@ -507,6 +557,13 @@ function jobFull(j, box){
     box.append(sect("Emails about it", j.emails.length));
     for (const m of j.emails) box.append(mailLine(m));
   }
+  if (state && j.status === "new") {  // StateJobsNY: applications go to the agency, usually by email
+    const item = j.id.split(":").pop(), c = j.contact;
+    box.append(note("How to apply: " + (c ? "email your cover letter and resume to " + c.email + (c.name ? " (" + c.name + ")" : "") : "follow the vacancy's How to Apply section") +
+      ", and put item #" + item + " in the cover letter. The vacancy's own instructions are under The posting below; then tap Mark applied.", "warn"));
+    if (c) { const a = el("div", "acts"); a.append(button("Copy email", () => copy(c.email, "Email address"), "sm")); box.append(a); }
+  }
+  if (j.contacts) contactsBlock(j, box, j.status !== "new" && j.status !== "skipped");
   if (j.auto_apply || j.agency || j.docs) { const d = el("div"); box.append(d); drawDocs(d, j); }
   let decide = null;
   if (reviewable) decide = reviewForm(j, box);
@@ -675,6 +732,8 @@ function drawDocs(box, j){
   tiles.append(docTile(q + "resume" + t, "Tailored resume", "PDF \u00b7 projects and skills ordered for this job"), docTile(q + "cover" + t, "Cover letter", "PDF \u00b7 drafted by the local model"));
   box.append(tiles);
   for (const w of dc.warnings || []) box.append(note(w, "warn"));
+  const twin = dc.resume_from && JOB.get(dc.resume_from);
+  if (dc.resume_from) box.append(note("Same resume as your application for " + (twin ? "\u201c" + twin.title + "\u201d" : "another role") + " here, so the company sees one version of you. The cover letter is this job's own."));
   const d = fold("Edit the summary and the cover letter");
   const sum = inp("textarea", dc.summary || ""), cov = inp("textarea", dc.cover || "");
   sum.rows = 4; cov.rows = 14;
@@ -686,7 +745,8 @@ function drawDocs(box, j){
   }, "go");
   const again = button("Write them again", () => { if (confirm("Write a new summary and cover letter? Your edits are replaced.")) makeDocs(j, box, again); });
   const a = el("div", "acts"); a.append(save, again);
-  d.append(field("Resume summary", sum, "Your bullets stay as they are; only this summary and the order of projects and skills change per job."),
+  if (dc.resume_from) sum.disabled = true;
+  d.append(field("Resume summary", sum, dc.resume_from ? "Kept the same as the resume this company already has." : "Your bullets stay as they are; only this summary and the order of projects and skills change per job."),
            field("Cover letter", cov, "Check every claim. Blank lines start new paragraphs."), a);
   box.append(d);
 }
@@ -722,17 +782,74 @@ function searchButton(){
   return b;
 }
 let nextApply = {n: -1, a: null};
+// The autofill script: installed in this browser (it tells the panel its version when it
+// runs here) and the latest one the server has. Install and update are the same link: the
+// script manager shows its install or update page for it.
+const AF = {get latest(){ return D.autofill ? D.autofill.version : null; }};
+function afChanged(){ listSig = actsSig = ""; if (place === "settings" && setTabId === "app") pageBuilt = ""; render(); }
+window.addEventListener("agent-autofill", afChanged);
+const afInstalled = () => document.documentElement.dataset.autofill || "";
+function afState(){
+  const have = afInstalled();
+  return !have ? "missing" : AF.latest && +have < +AF.latest ? "old" : "ok";
+}
+// A run of the autofill sending approved applications, as the script reports it, with
+// Pause, Resume and Stop. The script reads them within a couple of seconds.
+const AF_STEP = {filling: ["", "Filling"], ready: ["", "Sending in a few seconds"], paused: ["warn", "Paused"], sending: ["", "Sending"],
+  waiting: ["", "Waiting for the confirmation"], captcha: ["warn", "CAPTCHA: needs you"], needs_you: ["warn", "Needs you"], sent: ["good", "Sent"],
+  next: ["", "Opening the next one"], stopped: ["", "Stopped"], done: ["good", "All sent"]};
+const afLive = () => { const l = D.autofill && D.autofill.live; return l && !["stopped", "done"].includes(l.step) ? l : null; };
+function afCommand(cmd){
+  setTimeout(() => refresh("autofill"), 2500);  // the script acts within about two seconds
+  return send("/api/autofill/command", "POST", {cmd}).then(() => toast(cmd === "stop" ? "Stopping the autofill" : cmd === "pause" ? "Pausing the autofill" : cmd === "skip" ? "Skipping this one; it stays approved for later" : "Resuming"), fail);
+}
+function afControls(){
+  const l = afLive();
+  if (!l) return null;
+  const k = AF_STEP[l.step] || ["", l.step], box = el("div", "afbar");
+  const t = el("div", "aft");
+  t.append(chip(k[0], k[1]), el("b", null, l.company || "Applying"), el("span", "dim", [l.title, l.note, l.left ? l.left + " left" : ""].filter(Boolean).join("  \u00b7  ")));
+  const acts = el("div", "acts");
+  if (l.step === "paused") acts.append(button("Resume", () => afCommand("resume"), "sm go"));
+  else if (["ready", "filling"].includes(l.step)) acts.append(button("Pause", () => afCommand("pause"), "sm"));  // only before it's sent
+  if (["filling", "ready", "paused", "waiting", "needs_you", "captcha"].includes(l.step)) {
+    const sk = button("Skip", () => afCommand("skip"), "sm");
+    sk.title = "Leave this job approved for later and go on to the next one";
+    acts.append(sk);
+  }
+  acts.append(button("Stop all", () => afCommand("stop"), "sm bad"));
+  box.append(t, acts);
+  box.sig = "af" + l.step + l.job_id + l.left + l.note;
+  return box;
+}
+function autofillButton(always){
+  const st = afState(), have = afInstalled();
+  if (st === "ok" && !always) return null;
+  // versions before 16 can't report themselves, so "missing" may be an old one
+  const text = st === "missing" ? "Install or update autofill" : st === "old" ? "Update autofill (v" + have + " \u2192 v" + AF.latest + ")" : "Reinstall autofill v" + have;
+  const a = link("/jobs-fill.user.js", text, null, "sm" + (st === "old" ? " go" : ""));
+  a.sig = "af" + st + have + AF.latest;
+  a.title = st === "missing" ? "Fills application forms and sends the ones you approve. Needs Tampermonkey or Violentmonkey (Userscripts on iPhone)." : "Opens your script manager's update page";
+  a.addEventListener("click", () => toast("Confirm in your script manager, then reload this page"));
+  return a;
+}
 function applyButton(){
   const n = D.jobs ? D.jobs.approved : 0;
-  if (!n) return null;
-  const a = link("#", "Apply to approved (" + n + ")", null, "sm go");
-  a.sig = "apply" + n;
-  a.style.display = "none";
+  if (!n || afLive()) return null;
+  const w = el("span", "applyw");
+  const a = link("#", "Apply to approved (" + n + ")", null, "sm go"), c = link("#", "Check each", null, "sm");
+  w.sig = "apply" + n;
+  w.style.display = "none";
+  w.append(a, c);
   api("/api/jobs/next").then(r => {
     const u = r.job && safeUrl(r.job.apply_url);
-    if (u) { a.href = u + "#agent-auto"; a.style.display = ""; a.title = "The autofill opens each approved application, fills it and submits it after a 3-second countdown."; }
+    if (!u) return;
+    a.href = u + "#agent-auto"; c.href = u + "#agent-auto-check"; w.style.display = "";
+    for (const x of [a, c]) x.addEventListener("click", () => { send("/api/autofill/command", "POST", {cmd: "start"}).catch(() => {}); });  // clears an earlier Stop
+    a.title = "The autofill opens each approved application, fills it and sends it after a 5-second countdown you can pause.";
+    c.title = "The autofill fills each one and waits for you to check it and tap Send.";
   }, () => {});
-  return a;
+  return w;
 }
 function readyButton(n, what){
   const s = D.jobs;
@@ -745,13 +862,18 @@ function readyButton(n, what){
   b.sig = "ready" + n;
   return b;
 }
-function jobActions(){ const s = D.jobs; return [applyButton(), s && readyButton(s.not_ready, "They join To review as they finish."), searchButton()].filter(Boolean); }
+function jobActions(){
+  const s = D.jobs, add = button("+ Add a job", () => showAddJob(), "sm go", "n");
+  add.sig = "add";
+  return [afControls(), add, applyButton(), autofillButton(), s && readyButton(s.not_ready, "They join To review as they finish."), searchButton()].filter(Boolean);
+}
 function agencyActions(){ const s = D.jobs; return [s && readyButton(s.agency_not_ready, "They show up under Ready as they finish.")].filter(Boolean); }
 
 // ---------- applications ----------
 function appDetail(x, box){
   box.append(head(x.company, [x.title, x.location].filter(Boolean).join("  \u00b7  "), statusChip(x.status)));
-  box.append(kv([["Applied", when(x.applied_at)], ["Approved", when(x.approved_at)], ["Match", x.score], ["Emails", x.emails], ["Replied", x.replied ? "Yes" : "Not yet"], ["Agency", x.agency]]));
+  box.append(kv([["Applied", when(x.applied_at)], ["Approved", when(x.approved_at)], ["Match", x.score], ["Emails", x.emails], ["Replied", x.replied ? "Yes" : "Not yet"], ["Agency", x.agency],
+    ["Source", x.outside ? "You applied outside the agent; it's tracking the emails" : ""]]));
   const more = el("div", "loading dim", "Loading the timeline\u2026");
   box.append(more);
   getDetail(x.id).then(j => {
@@ -761,6 +883,7 @@ function appDetail(x, box){
     if (url) acts.append(link(url, "Open posting", "o"));
     for (const [st, label, msg] of (NEXT_STATUS[j.status] || []).filter(s => s[0] !== "new")) acts.append(button(label, () => setJobStatus(j.id, st, msg)));
     box.append(acts);
+    if (j.contacts) contactsBlock(j, box, true);
     // timeline
     box.append(sect("Timeline"));
     const evs = [], sub = j.submission;
@@ -775,7 +898,8 @@ function appDetail(x, box){
     box.append(tl);
     // the application as it was sent
     box.append(sect("What was sent"));
-    if (!sub) { box.append(note(j.status === "approved" ? "Not sent yet. It's waiting for Apply to approved." : "No record of this application.")); return; }
+    if (!sub) { box.append(note(j.outside ? "Sent outside the agent, so it only knows what the emails say. Dated by the first email about it."
+      : j.status === "approved" ? "Not sent yet. It's waiting for Apply to approved." : "No record of this application.")); return; }
     box.append(note(sub.exact ? "Exact copy, recorded right before Submit on " + when(sub.at) + "." : "Rebuilt from the prepared answers on " + when(sub.at) + ". What was sent may differ.", sub.exact ? "good" : "warn"));
     if ((sub.files || []).length) {
       const tiles = el("div", "docs");
@@ -856,10 +980,215 @@ function inboxSetup(box){
   box.append(field("Address", addr), field("App password", pw), a);
 }
 
+// ---------- add a job by its link ----------
+// The agent reads the posting (or uses the description pasted for sites that can't be
+// read), scores it and prepares it like a nightly find; progress comes back in
+// /api/jobs as "adding" and shows in Jobs › Added.
+const NO_FETCH = /(^|\.)(linkedin|indeed|dice|monster|glassdoor|ziprecruiter|simplyhired|wellfound|joinhandshake|handshake|builtin|hiringcafe)\.[a-z.]+$/i;
+const ADD_STATE = {reading: ["", "Reading"], scoring: ["", "Scoring"], preparing: ["warn", "Preparing"], done: ["good", "Ready"], error: ["bad", "Didn't work"]};
+const addingNow = () => ((D.jobs && D.jobs.adding) || []).filter(a => ["reading", "scoring", "preparing"].includes(a.state));
+function addedItems(s){
+  const out = [];
+  for (const a of s.adding || []) {
+    const j = a.id && JOB.get(a.id);
+    if (a.state === "done" && j) continue;  // the job itself is listed below
+    out.push({id: "add:" + a.url, obj: a, kind: "adding", t: a.state === "error" ? "Couldn't add this job" : a.msg, r: chip(...(ADD_STATE[a.state] || ["", a.state])),
+      m: a.url, hay: a.url + " " + a.msg, sig: a.state + a.msg});
+  }
+  const jobs = s.jobs.filter(j => j.added).sort((x, y) => (y.added || "").localeCompare(x.added || ""));
+  return out.concat(jobs.map(j => jobItem(j, "added " + ago(j.added))));
+}
+function addingDetail(a, box){
+  const st = ADD_STATE[a.state] || ["", a.state];
+  box.append(head(a.state === "error" ? "Couldn't add this job" : "Adding a job", a.url, chip(st[0], st[1])));
+  box.append(el("p", "lede", a.msg));
+  if (a.state !== "error") box.append(el("div", "loading dim", "The agent reads the posting, scores it, then writes the answers, tailored resume and cover letter. About 4 minutes; this updates on its own."));
+  else { const acts = el("div", "acts"); acts.append(button("Try again", () => showAddJob(a.url), "go")); box.append(acts); }
+}
+function showAddJob(url){
+  const o = $("help"); o.replaceChildren();
+  const s = el("div", "sheet brk"); s.append(el("h1", null, "Add a job"));
+  s.append(el("p", "dim", "Paste a job's link. The agent reads the posting, scores it, and prepares the answers, tailored resume and cover letter, the same as the jobs it finds overnight."));
+  const link = inp("input", url || "", "https://…  (the job posting's link)"); link.type = "url"; link.autocomplete = "off";
+  const text = inp("textarea", "", "Job title on the first line, then the description"); text.rows = 8;
+  const company = inp("input", "", "Company name");
+  const hint = el("div", "help", "Only needed for sites the agent can't read (LinkedIn, Indeed, Glassdoor and similar), or if reading the link fails.");
+  const check = () => {
+    let host = ""; try { host = new URL(link.value.trim()).hostname; } catch (e) {}
+    const blocked = NO_FETCH.test(host);
+    hint.textContent = blocked ? host + " doesn't allow automated reading: paste the job title and description here." : "Only needed for sites the agent can't read (LinkedIn, Indeed, Glassdoor and similar), or if reading the link fails.";
+    hint.className = "help" + (blocked ? " warnc" : "");
+    return blocked;
+  };
+  link.addEventListener("input", check);
+  const submit = button("Add and prepare", async () => {
+    const u = link.value.trim();
+    if (!/^https:\/\/\S+\.\S+/.test(u)) return toast("Paste the job's full https:// link.", true);
+    if (check() && !text.value.trim()) return toast("Paste the job description for this site.", true);
+    submit.disabled = true;
+    try { await send("/api/jobs/add", "POST", {url: u, text: text.value, company: company.value}); }
+    catch (e) { submit.disabled = false; return fail(e); }
+    o.hidden = true;
+    toast("Adding it. It shows under Jobs › Added.");
+    TAB.jobs = "added"; store("v2:tab:jobs", "added"); FILTER.jobs = "";
+    go("jobs");
+    for (const t of [1500, 5000, 15000]) setTimeout(() => refresh("jobs"), t);
+  }, "go");
+  const cancel = button("Cancel", () => { o.hidden = true; });
+  const a = el("div", "acts"); a.append(submit, cancel);
+  s.append(field("Link", link), field("Description (optional)", text), field("Company (with a pasted description)", company), hint, a);
+  o.append(s); o.hidden = false;
+  o.onclick = e => { if (e.target === o) o.hidden = true; };
+  check(); setTimeout(() => link.focus(), 50);
+}
+// ---------- reach out ----------
+// Who to contact about a job, from /api/jobs/detail's "contacts": warm contacts who
+// emailed about it, then recruiters, alumni, engineers and hiring managers, each with a
+// LinkedIn people search (built by the agent from the company name; the agent itself
+// never visits LinkedIn), a short note to copy, and a "contacted" mark.
+const needsReach = x => !x.outside && ["applied", "interview"].includes(x.status) && (x.reached || 0) < 4 && Date.now() - new Date(x.applied_at || x.approved_at) < 21 * 864e5;
+function contactsBlock(j, box, open){
+  const c = j.contacts, d = fold("Reach out", c.contacted + " of 4 contacted", c.contacted ? "good" : "warn");
+  d.open = open; d.classList.add("reach");
+  if (c.warm.length) {
+    d.append(el("div", "mixt", "Already in touch"));
+    for (const w of c.warm) {
+      const row = el("div", "warm"), k = MAIL[w.kind] || ["", w.kind];
+      row.append(chip(k[0], k[1]), el("b", null, w.name), el("span", "dim", w.address));
+      row.append(button("Copy email", () => copy(w.address, "Email address"), "sm"));
+      d.append(row);
+    }
+  }
+  const grid = el("div", "contacts");
+  for (const k of c.kinds) {
+    const card = el("div", "ccard" + (k.done ? " done" : "")), top = el("div", "chead");
+    top.append(el("b", null, k.label), k.done ? chip("good", "Contacted " + day(k.done)) : chip("", "Not yet"));
+    const note = el("div", "cnote", k.note);
+    const acts = el("div", "acts");
+    acts.append(link(k.url, "Search LinkedIn"), button("Copy note", () => copy(k.note, "Note"), "sm"),
+      button(k.done ? "Undo" : "Mark contacted", async () => {
+        try { await send("/api/jobs/outreach", "POST", {id: j.id, kind: k.kind, done: !k.done}); } catch (e) { return fail(e); }
+        k.done = k.done ? null : new Date().toISOString();
+        c.contacted = c.kinds.filter(x => x.done).length;
+        DETAIL.delete(j.id);
+        const app = D.apps && D.apps.applications.find(a => a.id === j.id);
+        if (app) app.reached = c.contacted;
+        const fresh = el("div"); d.replaceWith(fresh); contactsBlock(j, fresh, true); fresh.replaceWith(fresh.firstChild);
+        editing = true;  // keep this pane as it is while the list catches up
+        RAW.apps = ""; refresh("apps");
+      }, "sm" + (k.done ? "" : " go")));
+    card.append(top, el("div", "dim small", k.why), note, acts);
+    grid.append(card);
+  }
+  d.append(grid, el("p", "dim small", "The links open LinkedIn's people search in your browser; the agent never visits LinkedIn. Notes fit LinkedIn's 200-character limit for connection requests."));
+  box.append(d);
+}
+// Open a job from anywhere (Explore's lists): pick the place and tab that hold it
+function openJob(id){
+  const j = JOB.get(id);
+  if (!j) return toast("That job isn't in the lists any more.", true);
+  if (["applied", "interview", "offer", "rejected", "withdrew"].includes(j.status)) return jumpTo("apps", "all", id);
+  if (isClosed(j)) return jumpTo("jobs", "closed", id);
+  if (byHand(j)) return jumpTo("agencies", j.status === "new" ? ((D.jobs.agency_ready || []).includes(id) ? "ready" : "open") : "applied", id);
+  if (j.status === "approved") return jumpTo("jobs", "accepted", id);
+  if (j.status === "skipped") return jumpTo("jobs", "declined", id);
+  jumpTo("jobs", (D.jobs.review || []).includes(id) ? "awaiting" : "open", id);
+}
+
+// ---------- explore: recruiters across the US ----------
+function drawRecruiters(r, body){
+  body.append(el("p", "lede", "Recruiters to reach anywhere in the US: people who already emailed you, then recruiters at the companies with your strongest open matches, in the cities where your matches are, and at staffing agencies. The links open LinkedIn's people search in your browser; the agent never visits LinkedIn."));
+  const cards = el("div", "cards"); body.append(cards);
+  const touch = el("section", "card w12 brk");
+  touch.append(el("h2", null, "Already in touch"));
+  if (!r.in_touch.length) touch.append(el("p", "dim", "Nobody yet. Recruiters who email your applications inbox show up here."));
+  for (const p of r.in_touch) {
+    const row = el("div", "warm"), k = MAIL[p.kind] || ["", p.kind];
+    row.append(chip(k[0], k[1]), el("b", null, p.name), el("span", "dim", [p.company, p.address].filter(Boolean).join("  \u00b7  ")), button("Copy email", () => copy(p.address, "Email address"), "sm"));
+    touch.append(row);
+  }
+  cards.append(touch);
+  const group = (title, sub, items, label) => {
+    const c = el("section", "card w12 brk");
+    c.append(el("h2", null, title), el("p", "dim small", sub));
+    if (!items.length) c.append(el("p", "dim", "None yet; they appear as the search finds strong matches."));
+    const grid = el("div", "contacts");
+    for (const it of items) {
+      const card = el("div", "ccard"), head = el("div", "chead");
+      head.append(el("b", null, label(it)), it.strong ? chip("good", it.strong + " strong") : it.open ? chip("", it.open + " open") : el("span"));
+      const acts = el("div", "acts");
+      for (const [text, url] of it.links) acts.append(link(url, text));
+      acts.append(button("Copy note", () => copy(it.note, "Note"), "sm"));
+      card.append(head, el("div", "cnote", it.note), acts);
+      grid.append(card);
+    }
+    c.append(grid); cards.append(c);
+  };
+  group("At your best-matching companies", "Companies with the most strong open matches for you.", r.companies, it => it.company);
+  group("Where your matches are", "Cities with the most good open matches.", r.cities, it => it.city);
+  group("Staffing agencies", "Their recruiters place contract and contract-to-hire roles, often fast.", r.agencies, it => it.company);
+}
+
+// ---------- explore: where to look ----------
+let exploreTab = store("v2:explore") || "capital";
+function drawExplore(box){
+  const top = el("div", "ptop");
+  top.append(el("h1", null, "Explore"), tabsBar([["capital", "Near Albany"], ["ny", "New York"], ["visa", "Visa-friendly"], ["recruiters", "Recruiters (US)"]], exploreTab,
+    t => { exploreTab = t; store("v2:explore", t); drawPage(true); }));
+  const body = el("div", "explore");
+  box.append(top, body);
+  body.append(el("div", "loading dim", "Counting openings…"));
+  api("/api/explore").then(e => {
+    body.replaceChildren();
+    if (exploreTab === "recruiters") return drawRecruiters(e.recruiters, body);
+    const r = e[exploreTab], cards = el("div", "cards");
+    const intro = {capital: "Openings the search found in the Capital Region (Albany, Schenectady, Troy, Saratoga and nearby), the employers behind them, and local portals.",
+      ny: "Openings elsewhere in New York State, mostly New York City, and statewide portals.",
+      visa: "Openings at companies whose postings say they sponsor visas, and portals with employers' H-1B history."}[exploreTab];
+    body.append(el("p", "lede", intro));
+    const st = el("div", "stats");
+    for (const [v, k] of [[r.open_count, "Open matches"], [r.good, "Good or better"], [r.companies.length, exploreTab === "visa" ? "Sponsoring employers" : "Employers hiring"]]) { const d = el("div"); d.append(el("b", null, String(v)), el("span", null, k)); st.append(d); }
+    body.append(st, cards);
+    const jobsCard = el("section", "card w8 brk");
+    jobsCard.append(el("h2", null, "Best open matches"));
+    if (!r.open.length) jobsCard.append(el("p", "dim", exploreTab === "capital" ? "None right now. Local employers' boards are added to the nightly search as it finds them." : "None right now."));
+    for (const j of r.open) {
+      const row = el("div", "trow"), sc = scoreSpan(j.score);
+      row.append(sc, el("span", "tt", j.title + "  ·  " + j.company), j.sponsors ? chip("good", "Sponsors") : j.no_sponsorship ? chip("bad", "No sponsorship") : el("span"), el("span", "tm", j.location + (j.status === "approved" ? "  ·  approved" : "")));
+      row.onclick = () => openJob(j.id);
+      jobsCard.append(row);
+    }
+    cards.append(jobsCard);
+    const side = el("section", "card brk");
+    side.append(el("h2", null, exploreTab === "visa" ? "Employers that sponsor" : "Employers to watch"));
+    if (!r.companies.length) side.append(el("p", "dim", "None yet."));
+    for (const c of r.companies) {
+      const row = el("div", "line");
+      row.append(el("span", null, c.company), el("b", c.open ? null : "dim", c.open ? c.open + " open · best " + c.best : c.postings + (c.postings === 1 ? " posting seen" : " postings seen")));
+      side.append(row);
+    }
+    if (exploreTab === "visa" && r.refusers.length) {
+      side.append(el("div", "mixt", "Say they won't sponsor"));
+      for (const c of r.refusers) { const row = el("div", "line"); row.append(el("span", "dim", c.company), el("b", "dim", c.postings + " postings")); side.append(row); }
+    }
+    cards.append(side);
+    const portals = el("section", "card w12 brk");
+    portals.append(el("h2", null, "Portals to check"));
+    const pl = el("div", "portals");
+    for (const [name, url, why] of r.portals) {
+      const a = el("a", "doc"); a.href = url; a.target = "_blank"; a.rel = "noopener noreferrer";
+      const t = el("div"); t.append(el("b", null, name + " ↗"), el("span", null, why));
+      a.append(icon("explore"), t); pl.append(a);
+    }
+    portals.append(pl, el("p", "dim small", "Links for you to browse; the agent doesn't read these sites."));
+    cards.append(portals);
+  }, err => body.replaceChildren(note("Couldn't load: " + err.message, "bad")));
+}
+
 // ---------- full-page places: Insights, Assistant, Settings ----------
 // These fill the whole pane and are built once when opened, so polling never wipes a
 // half-typed message or setting.
-const PAGES = {insights: drawInsights, assistant: drawAssistant, settings: drawSettings};
+const PAGES = {insights: drawInsights, explore: drawExplore, assistant: drawAssistant, settings: drawSettings};
 let pageBuilt = "";
 function drawPage(force){
   if (!force && pageBuilt === place) return;
@@ -1168,6 +1497,10 @@ async function pollAgent(){
     for (const e of s.events) { AG.events.push(e); AG.last = Math.max(AG.last, e.n); if (AG.box && AG.box.isConnected) paintEvent(AG.box, e, true); }
     const was = AG.pending && AG.pending.id;
     AG.status = s.status; AG.task = s.task; AG.pending = s.pending;
+    if (JSON.stringify(s.power) !== JSON.stringify(AG.power)) { AG.power = s.power; drawStatus(); }
+    const hk = s.heat ? [s.heat.hot, s.heat.until, Math.round((s.heat.temp || 0) / 3)].join() : "";  // redraw on state, not every degree
+    if (hk !== AG.heatKey) { AG.heatKey = hk; AG.heat = s.heat; drawStatus(); if (place === "home") drawDash(); }
+    else AG.heat = s.heat;
     if ((AG.pending && AG.pending.id) !== was) { paintPending(); drawNav(); }
     drawAgentStatus();
   } catch (e) {}
@@ -1232,11 +1565,11 @@ function drawTasks(body){
 let setTabId = store("v2:settings") || "profile";
 function drawSettings(box){
   const top = el("div", "ptop");
-  top.append(el("h1", null, "Settings"), tabsBar([["profile", "Profile"], ["rules", "Hiring rules"], ["workday", "Workday"], ["memory", "Memory"], ["app", "App"]], setTabId,
+  top.append(el("h1", null, "Settings"), tabsBar([["profile", "Profile"], ["auto", "Auto mode"], ["rules", "Hiring rules"], ["workday", "Workday"], ["memory", "Memory"], ["app", "App"]], setTabId,
     t => { setTabId = t; store("v2:settings", t); drawPage(true); }));
   const body = el("div", "settings");
   box.append(top, body);
-  ({profile: drawProfile, rules: drawRules, workday: drawWorkday, memory: drawMemory, app: drawApp})[setTabId](body);
+  ({profile: drawProfile, auto: drawAuto, rules: drawRules, workday: drawWorkday, memory: drawMemory, app: drawApp}[setTabId] || drawProfile)(body);
 }
 function saveBar(onSave, label){
   const bar = el("div", "savebar"), msg = el("span", "dim");
@@ -1332,7 +1665,7 @@ function drawRules(body){
       const x = button("\u00d7", () => { row.remove(); sv.dirty(); }, "sm"); x.setAttribute("aria-label", "Remove"); row.append(x);
       box.append(row);
     };
-    body.append(sect("Company caps"), el("p", "dim small", "Most companies: at most this many applications in this many days. Add companies with their own caps."));
+    body.append(sect("Company caps"), el("p", "dim small", "Most companies: at most this many applications, each for a different role, in this many days. Every application counts, whatever came of it. Jobs past the cap wait in Jobs \u203a Later and come back to review when the oldest application ages out. Add companies with their own caps."));
     const dmax = num(st.limit.max, "Most applications"), ddays = num(st.limit.days, "Days");
     const def = el("div", "kvrow"); def.append(el("span", null, "Default: at most"), dmax, el("span", null, "in days"), ddays); body.append(def);
     const caps = el("div"); body.append(caps);
@@ -1425,10 +1758,132 @@ function drawApp(body){
     else { txt.textContent = "Off. Turn them on to hear about assessments, interviews and offers the moment they arrive."; acts.append(button("Turn on alerts", () => turnOnAlerts().then(() => { toast("Alerts are on"); paint("on"); }, fail), "go")); }
   };
   alertState().then(paint, () => paint("unsupported"));
-  const af = el("section", "card brk w6"); af.append(el("h2", null, "Autofill script"), el("p", "dim", "Fills application forms in your browser and submits the ones you approved. Install it in Tampermonkey or Violentmonkey (Userscripts on iPhone); it updates itself after that."));
-  const a1 = el("div", "acts"); const inst = el("a", "btn go", "Install or update"); inst.href = "/jobs-fill.user.js"; a1.append(inst); af.append(a1); cards.append(af);
+  const af = el("section", "card brk w6"), afh = el("h2"), st = afState();
+  afh.append(el("span", null, "Autofill script"), chip(st === "ok" ? "good" : "warn", st === "ok" ? "v" + afInstalled() + " \u00b7 up to date" : st === "old" ? "Update to v" + AF.latest : "Not installed here"));
+  af.append(afh, el("p", "dim", "Fills application forms in your browser and submits the ones you approved. Install it in Tampermonkey or Violentmonkey (Userscripts on iPhone). Your script manager checks for updates by itself; the button gets the latest right away."));
+  if (st === "missing") af.append(el("p", "faint small", "Installed already? Versions before 16 can't tell the panel, so update once. After that, if it still says this, allow the script on this site in your script manager and reload."));
+  const a1 = el("div", "acts"); a1.append(autofillButton(true)); af.append(a1); cards.append(af);
   const cl = el("section", "card brk w12"); cl.append(el("h2", null, "Classic panel"), el("p", "dim", "The previous design, kept for now. Everything it does is also here."));
   const a2 = el("div", "acts"); a2.append(link("/classic", "Open the classic panel")); cl.append(a2); cards.append(cl);
+}
+
+// ---------- auto mode ----------
+// The switch, the to-do list and the settings page. The server does the work: it holds
+// jobs past the company cap, skips the kinds of job Sai always skips, and pushes the
+// to-do list each evening. Approving, consents and sending stay his.
+const autoOn = () => !!(D.auto && D.auto.settings && D.auto.settings.on);
+async function setAuto(change){
+  try { const st = await send("/api/auto", "PUT", change); if (D.auto) D.auto.settings = st; }
+  catch (e) { return fail(e); }
+  toast(change.on === true ? "Auto mode is on" : change.on === false ? "Auto mode is off" : "Saved");
+  RAW.auto = ""; RAW.jobs = ""; listSig = ""; pageBuilt = "";
+  render();
+  setTimeout(() => refresh("auto", "jobs"), 1500);
+}
+function autoSwitch(){
+  const on = autoOn(), b = el("button", "switch" + (on ? " on" : ""));
+  b.setAttribute("role", "switch"); b.setAttribute("aria-checked", String(on));
+  b.append(el("i"), el("span", null, "Auto mode " + (on ? "on" : "off")));
+  b.title = on ? "Skipping what you always skip, holding jobs past the company cap, and sending you a to-do list each evening"
+               : "Turn on to have the agent skip what you always skip and send you a to-do list each evening";
+  b.onclick = () => setAuto({on: !on});
+  return b;
+}
+const TODO_KIND = {mail: "Reply", send: "Send", review: "Review", question: "Answer", agency: "Apply", reach: "Reach out", auto: "Check", problem: "Fix", learning: "Learning"};
+function todoGo(i){
+  if (i.place === "inbox" && i.id) return jumpTo("inbox", i.tab, i.id);
+  if (i.place === "settings") { setTabId = i.tab || "auto"; store("v2:settings", setTabId); pageBuilt = ""; return go("settings"); }
+  if (LISTS[i.place] && i.tab) { TAB[i.place] = i.tab; store("v2:tab:" + i.place, i.tab); FILTER[i.place] = ""; listSig = ""; }
+  go(i.place || "home");
+}
+function todoRows(box, items){
+  for (const i of items) {
+    const row = el("div", "trow"), due = i.due && dueAt(i.due);
+    row.append(chip(i.tone || "", TODO_KIND[i.kind] || i.kind), el("span", "tt", i.title),
+      due ? countdown(due) : el("span", i.due ? "dim" : "dim go", i.due || "Open \u25B8"), el("span", "tm", i.detail || ""));
+    row.title = i.detail || "";
+    row.onclick = () => todoGo(i);
+    box.append(row);
+  }
+}
+function todoCard(){
+  const a = D.auto, items = (a && a.items) || [];
+  const c = el("section", "card w8 brk todo"), h = el("h2");
+  const real = items.filter(i => i.kind !== "learning").length;
+  h.append(el("span", null, "To-do"), real ? chip("warn", real + (real === 1 ? " thing" : " things") + " for you") : chip("good", "All clear"));
+  c.append(h);
+  if (!a) c.append(el("div", "dim", "Loading\u2026"));
+  else if (!items.length) c.append(el("div", "dim", "Nothing needs you right now. Emails that need you, applications to send and review, and anything that went wrong show up here."));
+  todoRows(c, items);
+  if (a) {
+    const f = el("div", "acts");
+    f.append(el("span", "dim small", "On your phone every day at " + a.settings.report_at + (a.report ? ". Last sent " + ago(a.report.at) : "") + "."),
+      button("Send it now", e => send("/api/auto/report", "POST").then(() => toast("To-do list on its way"), fail), "sm"));
+    c.append(f);
+  }
+  return c;
+}
+function drawAuto(body){
+  body.append(el("div", "dim", "Loading\u2026"));
+  api("/api/auto").then(a => {
+    D.auto = a; body.replaceChildren();
+    const st = a.settings, m = a.model || {};
+    body.append(el("p", "lede", "Auto mode does the sorting so you only do what needs you. It holds jobs past your company cap until they can go out, skips the kinds of job you always skip, gives every application at one company the same resume, and each evening sends you a to-do list. It never approves, ticks a consent, submits or sends anything: those stay yours."));
+    const cards = el("div", "cards"); body.append(cards);
+
+    const sw = el("section", "card brk w6"); sw.append(el("h2", null, "Auto mode"));
+    const tk = a.scheduler && a.scheduler.tick_at;
+    const stale = !tk || Date.now() - Date.parse(tk) > 5 * 60e3;
+    sw.append(el("p", stale ? "warnc small" : "faint small", tk ? "Scheduler last ran " + (ago(tk) === "now" ? "just now" : ago(tk)) + (stale ? ". It runs every minute, so something's holding it up." : ".") : "Scheduler hasn't run since the server started."));
+    const swr = el("div", "acts"); swr.append(autoSwitch()); sw.append(swr);
+    const skip = el("input"); skip.type = "checkbox"; skip.checked = st.skip;
+    const sl = el("label", "check"); sl.append(skip, el("span", null, "Skip jobs it's sure you'd skip"));
+    const time = el("input", "inp"); time.type = "time"; time.value = st.report_at;
+    sw.append(sl, field("To-do list time", time, "Pushed to your devices once a day."));
+    const save = button("Save", () => setAuto({skip: skip.checked, report_at: time.value}), "go");
+    const sa = el("div", "acts"); sa.append(save, button("Send the to-do list now", () => send("/api/auto/report", "POST").then(() => toast("To-do list on its way"), fail)));
+    sw.append(sa); cards.append(sw);
+
+    const rule = el("section", "card brk w6"); rule.append(el("h2", null, "Your company rule"));
+    const held = (D.jobs ? D.jobs.jobs : []).filter(j => !j.agency && heldUntil(j) && (j.score || 0) >= D.jobs.good).length;
+    rule.append(el("p", null, "At most 3 different roles at one company in any 30 days. Every application counts, whatever came of it, and the count resets as old ones age out."),
+      el("p", "dim", "Jobs past it wait in Jobs \u203a Later and come back to review on their own. Change the numbers in Hiring rules \u203a Company caps."),
+      line("Waiting now", held));
+    const ra = el("div", "acts"); ra.append(button("Show them \u25B8", () => todoGo({place: "jobs", tab: "later"}), "sm")); rule.append(ra);
+    rule.append(el("h3", null, "One resume per company"),
+      el("p", "dim", "Once a resume goes to a company, its other jobs get that same resume: projects, skills and summary. Only the cover letter is each job's own."));
+    cards.append(rule);
+
+    const lr = el("section", "card brk w12"); const lh = el("h2");
+    lh.append(el("span", null, "What it learned from you"), chip(m.ready ? "good" : "", m.ready ? "Skipping on its own" : "Still learning"));
+    lr.append(lh);
+    if (!m.n) lr.append(el("p", "dim", "Nothing yet. Turn it on and it learns from every job you approve or skip."));
+    else {
+      lr.append(line("Your decisions it learns from", m.n + " (" + m.applied + " applied, " + m.skipped + " skipped)"),
+        el("p", "faint small", "Skips at a company you'd applied to in the last 30 days aren't counted: those were about timing, which the company rule handles."));
+      const t = m.test;
+      if (t) lr.append(el("p", "dim", m.ready
+        ? "Tested on your latest " + t.n + " decisions: it would have skipped " + t.skipped + ", and you'd applied to " + t.wrong + " of those. That's accurate enough, so it skips on its own."
+        : "Tested on your latest " + t.n + " decisions, it couldn't skip enough of them without also skipping jobs you applied to, so it doesn't skip on its own yet. It sorts your review list instead, and tests itself again as you decide more."));
+      if (t && t.likely) lr.append(el("p", "dim", "Of the jobs it rated as your kind, you applied to " + t.likely_applied + " of " + t.likely + ". That's why approving stays with you."));
+      if ((a.clear || []).length) {
+        lr.append(el("h3", null, "Always skipped for you"));
+        for (const c of a.clear) lr.append(el("div", "line", c));
+      }
+      if ((a.patterns || []).length) {
+        lr.append(el("h3", null, "Patterns it uses to sort"));
+        const ch = el("div", "chips");
+        for (const pt of a.patterns) ch.append(chip(pt.up ? "good" : "warn", (pt.up ? "\u2191 " : "\u2193 ") + pt.text));
+        lr.append(ch);
+      }
+    }
+    if (a.skipped_total) {
+      const sa2 = el("div", "acts");
+      sa2.append(el("span", "dim", a.skipped_total + (a.skipped_total === 1 ? " job" : " jobs") + " skipped by Auto mode so far."), button("Show them \u25B8", () => todoGo({place: "jobs", tab: "auto"}), "sm"));
+      lr.append(sa2);
+    }
+    cards.append(lr);
+  }, e => body.replaceChildren(note("Couldn't load Auto mode: " + e.message, "bad")));
 }
 
 // ---------- home (dashboard) ----------
@@ -1446,13 +1901,17 @@ function drawDash(){
   else if (review) { p.append(el("b", null, review + (review === 1 ? " application is" : " applications are"))); p.append(" ready for you to review."); }
   else p.textContent = "Nothing to review right now. " + (s.not_ready ? s.not_ready + " more are being prepared." : "New ones are prepared overnight.");
   l.append(p); hero.append(l);
-  if (review) hero.append(button("Start reviewing \u25B8", startReview, "go", "Enter"));
+  const ha = el("div", "acts"); ha.append(autoSwitch());
+  if (review) ha.append(button("Start reviewing \u25B8", startReview, "go", "Enter"));
+  hero.append(ha);
   box.append(hero);
 
   const cards = el("div", "cards");
   box.append(cards);
 
-  // 1. needs your attention: emails that need him, codes, deadlines, and the agent's approvals
+  // 1. with Auto mode on, the to-do list (it has the emails that need him); otherwise
+  // what needs attention: emails that need him, codes, deadlines, and the agent's approvals
+  if (autoOn()) cards.append(todoCard());
   const pri = el("section", "card w8 brk"), need = needsYou();
   const total = need.length + (AG.pending ? 1 : 0);
   pri.classList.toggle("warn", total > 0);
@@ -1476,7 +1935,7 @@ function drawDash(){
     row.onclick = () => jumpTo("inbox", "needs", "m" + m.uid);
     pri.append(row);
   }
-  cards.append(pri);
+  if (!autoOn() || AG.pending || need.some(m => m.code)) cards.append(pri);  // codes and approvals are live, not on the list
 
   // 2. ready to review
   const mis = el("section", "card brk");
@@ -1486,10 +1945,16 @@ function drawDash(){
   br.append(big, el("span", "what", review === 1 ? "application" : "applications"));
   mis.append(br);
   if (s) {
-    mis.append(line("Being prepared", s.not_ready), line("Approved, waiting to send", s.approved), line("Agency jobs ready", (s.agency_ready || []).length));
+    mis.append(line("Being prepared", s.not_ready), line("Approved, waiting to send", s.approved), line("Ready to apply by hand", (s.agency_ready || []).length));
+    const later = s.jobs.filter(j => !j.agency && heldUntil(j) && (j.score || 0) >= s.good).length;
+    if (later) { const w = line("Waiting for the company cap", later); w.style.cursor = "pointer"; w.title = "They come back to review by themselves"; w.onclick = () => todoGo({place: "jobs", tab: "later"}); mis.append(w); }
+    const auto = s.jobs.filter(j => j.auto).length;
+    if (s.auto_on && auto) { const w = line("Skipped by Auto mode", auto); w.style.cursor = "pointer"; w.onclick = () => todoGo({place: "jobs", tab: "auto"}); mis.append(w); }
+    const live = afControls(); if (live) mis.append(live);
     const acts = el("div", "acts");
     if (review) acts.append(button("Start reviewing \u25B8", startReview, "go"));
     const ap = applyButton(); if (ap) acts.append(ap);
+    const af = autofillButton(); if (af) acts.append(af);
     if (!review && !ap) acts.append(button("See all jobs", () => go("jobs")));
     mis.append(acts);
   }
@@ -1529,31 +1994,67 @@ function drawDash(){
   const sv = el("section", "card brk");
   sv.append(el("h2", null, "Nightly job search"));
   if (s) {
-    const pr = s.progress || {}, lr = s.last_run || {};
+    // the night's search, even after a daytime one (which used to replace these numbers)
+    const pr = s.progress || {}, last = s.last_run || {}, lr = s.night_run || last;
     if (pr.running) {
       const bar = el("div", "pbar"), i = el("i"); i.style.width = (pr.total ? pr.done / pr.total * 100 : 4) + "%"; bar.append(i);
       sv.append(el("div", null, "Searching now: " + pr.step), bar, el("div", "dim", pr.total ? pr.done + " / " + pr.total : ""));
-    } else sv.append(el("div", "dim", lr.finished ? "Last search " + ago(lr.finished) + " (" + when(lr.finished) + ")" : "No search yet."));
+    } else sv.append(el("div", "dim", lr.finished ? (s.night_run ? "Night search " : "Last search ") + ago(lr.finished) + " (" + when(lr.finished) + ")" : "No search yet."));
     if (lr.boards != null) {
-      sv.append(line("Job boards checked", lr.boards), line("Postings scanned", (lr.fetched || 0).toLocaleString()), line("New postings", lr.new), line("Good matches", lr.matched));
+      sv.append(line("Job boards checked", lr.boards), line("Postings scanned", (lr.fetched || 0).toLocaleString()), line("New postings", lr.new), line("Passed the filters", lr.matched));
+      if (lr.good != null) sv.append(line("Good matches (60+)", lr.good));
+      if (lr.closed) sv.append(line("Postings closed", lr.closed));
+      if (lr.auto_skipped) sv.append(line("Skipped by Auto mode", lr.auto_skipped));
       if ((lr.board_errors || []).length) { const e = line("Boards that failed", lr.board_errors.length); e.title = lr.board_errors.join("\n"); e.querySelector("b").style.color = "var(--amber)"; sv.append(e); }
     }
-    const sb = searchButton();
-    if (sb) { const a = el("div", "acts"); a.append(sb); sv.append(a); }
+    if (s.night_run && last.manual && last.started > s.night_run.started && !pr.running)
+      sv.append(el("p", "dim small", "Searched again " + when(last.finished || last.started) + ": " + (last.new || 0) + " new postings, " + (last.matched || 0) + " passed the filters."));
+    const ht = AG.heat;
+    if (ht && ht.temp != null) {
+      const tl = line("CPU temperature", Math.round(ht.temp) + "\u00b0C");
+      if (ht.temp >= 85) tl.querySelector("b").style.color = "var(--amber)";
+      sv.append(tl);
+    }
+    if (ht && (ht.hot || ht.until)) sv.append(note(ht.until ? "Cooling down until " + when(new Date(ht.until * 1000).toISOString()) + ". The search and new tasks wait; nothing is lost."
+                                                           : "The CPU stayed above 90\u00b0C, so AI work is paused until it's below 70\u00b0C.", "warn"));
+    const a = el("div", "acts"), sb = searchButton();
+    if (sb) a.append(sb);
+    a.append(ht && (ht.hot || ht.until) ? button("Resume now", () => coolDown(0), "sm")
+                                       : button("Cool down 1 hour", () => coolDown(60), "sm"));
+    sv.append(a);
   } else sv.append(el("div", "dim", "Loading\u2026"));
   cards.append(sv);
 
-  // 5. the week's top suggestion
+  // 5. the week's top suggestion, and who to reach out to
   const sug = rep && (rep.suggestions || [])[0];
+  const reach = D.apps ? D.apps.applications.filter(needsReach) : [];
   if (sug) {
-    const c = el("section", "card w12 brk tip"), ih = el("h2");
+    const c = el("section", "card " + (reach.length ? "w8" : "w12") + " brk tip"), ih = el("h2");
     ih.append(el("span", null, "Top suggestion this week"), chip("", "1 of " + rep.suggestions.length));
     c.append(ih, el("b", null, sug.title), el("p", null, sug.detail));
     if (sug.evidence) c.append(el("p", "faint", sug.evidence));
     c.style.cursor = "pointer"; c.onclick = () => go("insights");
     cards.append(c);
   }
+  if (reach.length) {
+    const c = el("section", "card " + (sug ? "" : "w12 ") + "brk"), h2 = el("h2");
+    h2.append(el("span", null, "Reach out"), chip("warn", String(reach.length)));
+    const br2 = el("div", "bigrow"), n = el("span", "big", String(reach.length));
+    br2.append(n, el("span", "what", reach.length === 1 ? "recent application with nobody contacted yet" : "recent applications with people to contact"));
+    const acts = el("div", "acts");
+    acts.append(button("Show them \u25B8", () => { TAB.apps = "reach"; store("v2:tab:apps", "reach"); FILTER.apps = ""; go("apps"); }, "go"));
+    c.append(h2, br2, el("p", "dim small", "Recruiters, alumni, engineers and hiring managers, with a note ready to send."), acts);
+    cards.append(c);
+  }
   if (!counted && D.jobs && !REDUCED) { counted = true; countUp(box); }
+}
+function coolDown(minutes){
+  if (minutes && !confirm("Pause the agent's AI work for an hour? A running task stops, the model is unloaded, and the job search waits where it is.")) return;
+  send("/api/cooldown", "POST", {minutes}).then(r => {
+    toast(minutes ? "Cooling down for an hour" : "Resumed");
+    AG.heat = Object.assign({}, AG.heat || {}, {until: r.until || 0, hot: minutes ? (AG.heat || {}).hot : false}); AG.heatKey = "";
+    drawStatus(); drawDash();
+  }, fail);
 }
 function line(k, v){ const d = el("div", "line"); d.append(el("span", null, k), el("b", null, v == null ? "--" : String(v))); return d; }
 function countUp(root){
@@ -1573,7 +2074,28 @@ function drawStatus(){
   const pr = D.jobs && D.jobs.progress;
   if (!linkOk) { box.append(el("i", "led bad"), el("span", null, "Offline")); box.title = linkErr; return; }
   box.title = "";
+  const pw = AG.power;
+  if (pw && pw.ac === false) {  // the server's charger is unplugged
+    box.append(el("i", "led busy"), el("span", "warnc", "On battery " + (pw.battery != null ? pw.battery + "%" : "")));
+    box.title = "The server is running on battery" + (pw.minutes ? ", about " + Math.round(pw.minutes) + " min left" : "") + ". Plug it back in.";
+    return;
+  }
+  const ht = AG.heat;
+  if (ht && (ht.hot || ht.until)) {  // the agent's model work is paused for the CPU's sake
+    box.append(el("i", "led busy"), el("span", "warnc", "Cooling down" + (ht.temp ? " " + Math.round(ht.temp) + "\u00b0C" : "")));
+    box.title = ht.until ? "Paused from the panel until " + when(new Date(ht.until * 1000).toISOString()) + ". Resume it on Home."
+                         : "The CPU stayed above 90\u00b0C, so the agent paused its AI work. It carries on below 70\u00b0C.";
+    return;
+  }
+  const af = afLive();
+  if (af) {
+    const k = AF_STEP[af.step] || ["", af.step];
+    box.append(el("i", "led " + (k[0] === "warn" ? "bad" : "busy")), el("span", k[0] === "warn" ? "warnc" : null, k[1] + ": " + (af.company || "")));
+    box.title = "The autofill is sending approved applications. Pause or stop it in Jobs.";
+    return;
+  }
   if (pr && pr.running) { box.append(el("i", "led busy"), el("span", null, "Searching " + (pr.total ? pr.done + "/" + pr.total : "now"))); return; }
+  if (addingNow().length) { box.append(el("i", "led busy"), el("span", null, "Adding a job")); return; }
   box.append(el("i", "led"), el("span", null, "Connected"));
 }
 function tick(){
@@ -1636,6 +2158,7 @@ document.addEventListener("keydown", e => {
   }
   if (k === "g") { gPending = Date.now(); return; }
   if (k === "?") { e.preventDefault(); showHelp(); return; }
+  if (k === "n" && !LISTS[place]) { e.preventDefault(); showAddJob(); return; }
   if (k === "/") { e.preventDefault(); focusFilter(); return; }
   if (place === "home") {
     if (k === "Enter" && D.jobs && (D.jobs.review || []).length) { e.preventDefault(); startReview(); }
@@ -1647,6 +2170,7 @@ document.addEventListener("keydown", e => {
   else if (k === "Enter") { if (curItem()) { e.preventDefault(); openDetail(); } }
   else if (k === "Escape") { if ($("main").classList.contains("open")) closeDetail(); else if (FILTER[place]) { FILTER[place] = ""; $("q").value = ""; render(); } }
   else if (k === "a" || k === "s" || k === "d") { if (press(k)) e.preventDefault(); }
+  else if (k === "n" && place === "jobs") { e.preventDefault(); showAddJob(); }
   else if (k === "o") { const a = $("detail").querySelector("a.btn[href^='https://']"); if (a) { e.preventDefault(); window.open(a.href, "_blank", "noopener,noreferrer"); } }
   else if (k === "c") { const it = curItem(); if (it && it.obj.code) copy(it.obj.code, "Code"); }
   else if (/^[1-9]$/.test(k)) { const t = LISTS[place].tabs[+k - 1]; if (t) { e.preventDefault(); setTab(t[0]); } }
@@ -1688,7 +2212,7 @@ function showHelp(){
   const g = el("div", "keys");
   const rows = [["\u2191 \u2193  or  j k", "Move down / up the list"], ["Enter", "Open (on Home: start reviewing)"], ["a", "Approve the application"], ["s", "Skip it"],
     ["Esc", "Go back / clear the search"], ["o", "Open the job posting or the email"], ["d", "Mark an email done"], ["c", "Copy a sign-in code"],
-    ["/  or  \u2318K", "Search the list"], ["1\u20134", "Switch tabs"]]
+    ["/  or  \u2318K", "Search the list"], ["1\u20135", "Switch tabs"], ["n", "Add a job by its link"]]
     .concat(PLACES.map(p => ["g " + p.key, "Go to " + p.label])).concat([["?", "This list"]]);
   for (const [a, b] of rows) g.append(el("kbd", "key", a), el("span", "dim", b));
   s.append(g); o.append(s); o.hidden = false;

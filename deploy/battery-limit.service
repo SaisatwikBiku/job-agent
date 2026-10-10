@@ -1,0 +1,6 @@
+[Unit]
+Description=Keep the battery between 75% and 80% on the charger
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/battery-limit

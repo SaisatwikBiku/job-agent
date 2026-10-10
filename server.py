@@ -14,12 +14,15 @@ import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import threading
 import time
+import urllib.request
 import uuid
 import zipfile
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
@@ -124,21 +127,27 @@ def _send_push(title, body, tag):
     payload = json.dumps({"title": title, "body": body[:180], "tag": tag})
     with push_lock:
         subs = load_subs()
-        keep = []
+        keep, sent, failed = [], 0, []
         for sub in subs:
             try:
                 webpush(subscription_info=sub, data=payload,
                         vapid_private_key=str(VAPID_FILE),
                         vapid_claims={"sub": PUSH_SUB}, ttl=3600)
                 keep.append(sub)
+                sent += 1
             except WebPushException as e:
                 status = getattr(e.response, "status_code", None)
+                failed.append(str(status))
                 if status not in (404, 410):  # 404/410 = subscription gone, drop it
                     keep.append(sub)
-            except Exception:
+            except Exception as e:
+                failed.append(type(e).__name__)
                 keep.append(sub)
         if keep != subs:
             save_subs(keep)
+    # every push is logged, so a phone that stopped getting them shows up here
+    print(f"push [{tag}] {title!r}: sent to {sent} of {len(subs)} device(s)"
+          + (f", failed: {', '.join(failed)}" if failed else "") + (f", {len(subs) - len(keep)} dropped" if len(keep) != len(subs) else ""), flush=True)
 
 
 def notify(title, body, tag="agent"):
@@ -447,8 +456,9 @@ async def stream_reply(chat_id, model, request):
 # ---------- job search ----------
 
 def panel_busy():
-    """A task or a chat reply is using the model; the job search waits for both."""
-    if state["status"] != "idle":
+    """A task or a chat reply is using the model, or the server is cooling down; the job
+    search and the inbox's model reading wait for all of them."""
+    if cooling() or state["status"] != "idle":
         return True
     if chat_active.acquire(blocking=False):
         chat_active.release()
@@ -493,6 +503,187 @@ def inbox_loop():
 
 
 threading.Thread(target=inbox_loop, daemon=True).start()
+
+
+# ---------- server health ----------
+# Problems the server can still report itself go to the phone as pushes: the charger
+# unplugged, the battery running down, power back, the disk filling up, overheating,
+# Ollama not answering, and coming back up after being down. A heartbeat file written
+# every 30 s says how long it was down and whether it was on battery at the time (on
+# 2026-10-01 the battery ran out and the server was down 48 minutes without a word).
+# A server that's completely dead can't send anything, so if AGENT_HEARTBEAT_URL is set
+# (a healthchecks.io ping URL, kept out of the repo), it's pinged every minute and that
+# service alerts the phone when the pings stop.
+POWER_DIR = Path("/sys/class/power_supply")
+HEARTBEAT_FILE = Path(os.environ.get("AGENT_HEARTBEAT_FILE", "/home/agentd/heartbeat.json"))
+HEARTBEAT_URL = os.environ.get("AGENT_HEARTBEAT_URL", "").strip()
+HEARTBEAT_URL_RE = re.compile(r"^https://hc-ping\.com/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+HEALTH_EVERY = 30         # seconds between checks
+DOWN_AFTER = 180          # a gap in the heartbeat longer than this counts as downtime (reboots take about a minute)
+BATTERY_STEPS = (50, 25, 10, 5)
+DISK_WARN = 90            # percent used
+# Heat. The i3 bursts to 51-55 W for about 30 s (PL2) and reaches the mid-90s on a single
+# prompt-heavy request, then drops back: that's within spec, so a spike alone isn't an alert
+# (it was, and on 2026-10-03 it read as an emergency). Staying at HOT_C for HOT_FOR seconds
+# is: the agent pauses its model work and unloads the model, alerts once, and carries on
+# below COOL_C. The panel's Cool down pauses it the same way for a while.
+HOT_C = 90
+HOT_FOR = 60
+COOL_C = 70
+health = {"ac": None, "battery": None, "minutes": None}
+heat = {"temp": None, "hot": False, "hot_since": None, "until": 0.0}  # until: Cool down pause, epoch seconds
+
+
+def cooling():
+    """True while the agent should leave the model alone: staying hot, or a Cool down."""
+    return heat["hot"] or time.time() < heat["until"]
+
+
+def unload_models():
+    """Free the CPU and memory now: unload every model Ollama has loaded."""
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:11434/api/ps", timeout=10) as r:
+            names = [m["name"] for m in json.loads(r.read()).get("models", [])]
+        for name in names:
+            req = urllib.request.Request("http://127.0.0.1:11434/api/generate", method="POST",
+                                         data=json.dumps({"model": name, "keep_alive": 0}).encode(),
+                                         headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=30).close()
+        return names
+    except Exception as e:
+        print(f"unload models: {e}", flush=True)
+        return []
+
+
+def read_sys(path):
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return ""
+
+
+def power():
+    """Charger and battery as the kernel reports them: (on charger, battery %, minutes left on battery)."""
+    ac, battery, minutes = None, None, None
+    for d in POWER_DIR.glob("*"):
+        kind = read_sys(d / "type")
+        if kind == "Mains" and read_sys(d / "online") in ("0", "1"):
+            ac = read_sys(d / "online") == "1"
+        elif kind == "Battery" and read_sys(d / "capacity").isdigit():
+            battery = int(read_sys(d / "capacity"))
+            energy, rate = read_sys(d / "energy_now"), read_sys(d / "power_now")
+            if energy.isdigit() and rate.isdigit() and int(rate) > 0 and read_sys(d / "status") == "Discharging":
+                minutes = int(int(energy) / int(rate) * 60)
+    return ac, battery, minutes
+
+
+def cpu_temp():
+    temps = []
+    for z in Path("/sys/class/thermal").glob("thermal_zone*"):
+        if read_sys(z / "type") in ("x86_pkg_temp", "TCPU") and read_sys(z / "temp").isdigit():
+            temps.append(int(read_sys(z / "temp")) / 1000)
+    return max(temps) if temps else None
+
+
+def ollama_up():
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:11434/api/version", timeout=10) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def span(seconds):
+    m = int(seconds // 60)
+    if m < 60:
+        return f"{max(m, 1)} min"
+    return f"{m // 60} h" + (f" {m % 60} min" if m % 60 else "")
+
+
+def local_time(ts):
+    """A time in Sai's time zone (the job search's), not the server's UTC."""
+    try:
+        tz = ZoneInfo(jobs.load_config().get("timezone") or "America/New_York")
+    except Exception:
+        tz = ZoneInfo("America/New_York")
+    return datetime.fromtimestamp(ts, tz).strftime("%-I:%M %p")
+
+
+def battery_line(battery, minutes):
+    return f"Battery at {battery}%" + (f", about {span(minutes * 60)} left" if minutes else "") + "."
+
+
+def health_loop():
+    # 1. Was the server down? The heartbeat says when it was last up and on what power.
+    try:
+        last = json.loads(HEARTBEAT_FILE.read_text())
+    except (OSError, ValueError):
+        last = None
+    if last and time.time() - last.get("at", 0) > DOWN_AFTER:
+        gap = time.time() - last["at"]
+        cause = " It was running on battery, so the battery probably ran out." if last.get("ac") is False else ""
+        notify("Server back online", f"It was down for about {span(gap)}, from {local_time(last['at'])} to {local_time(time.time())}.{cause}", tag="power")
+    warned, last_ping, hot_at, disk_at, ollama_bad = set(), 0, 0, 0, 0
+    while True:
+        try:
+            ac, battery, minutes = power()
+            if ac is not None and ac != health["ac"]:
+                if ac and health["ac"] is False:
+                    notify("Power restored", f"The server is on its charger again. Battery at {battery}%.", tag="power")
+                elif ac is False:
+                    first = "is running on battery" if health["ac"] is None else "was unplugged and is running on battery"
+                    notify("Server on battery", f"The server {first}. {battery_line(battery, minutes)} Plug it back in.", tag="power")
+                # levels at or above the current one are covered by this alert
+                warned = {s for s in BATTERY_STEPS if battery is not None and battery <= s} if ac is False else set()
+            if ac is False and battery is not None:
+                crossed = [s for s in BATTERY_STEPS if battery <= s and s not in warned]
+                if crossed:
+                    warned.update(crossed)
+                    notify("Server battery low", f"{battery_line(battery, minutes)} It shuts down when it runs out.", tag="battery")
+            health.update(ac=ac, battery=battery, minutes=minutes)
+            tmp = HEARTBEAT_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"at": time.time(), "ac": ac, "battery": battery}))
+            tmp.replace(HEARTBEAT_FILE)
+
+            now_ts = time.time()
+            disk = shutil.disk_usage("/")
+            used = disk.used / disk.total * 100
+            if used >= DISK_WARN and now_ts - disk_at > 86400:
+                disk_at = now_ts
+                notify("Server disk almost full", f"{used:.0f}% used, {disk.free / 1e9:.0f} GB free.", tag="health")
+            temp = cpu_temp()
+            heat["temp"] = temp
+            if temp is not None and temp >= HOT_C:
+                heat["hot_since"] = heat["hot_since"] or now_ts
+                if not heat["hot"] and now_ts - heat["hot_since"] >= HOT_FOR:
+                    heat["hot"] = True
+                    gone = unload_models()
+                    print(f"heat: {temp:.0f}°C for over {HOT_FOR} s; paused model work, unloaded {gone}", flush=True)
+                    if now_ts - hot_at > 3600:
+                        hot_at = now_ts
+                        notify("Server staying hot", f"CPU at {temp:.0f}°C for over a minute. The agent paused its AI work and "
+                               f"will carry on by itself below {COOL_C}°C. Short spikes are normal; this is longer.", tag="health")
+            else:
+                heat["hot_since"] = None
+                if heat["hot"] and temp is not None and temp <= COOL_C:
+                    heat["hot"] = False
+                    print(f"heat: down to {temp:.0f}°C; model work resumed", flush=True)
+            if int(now_ts) % 300 < HEALTH_EVERY:  # Ollama every 5 minutes; twice in a row before alerting
+                ollama_bad = 0 if ollama_up() else ollama_bad + 1
+                if ollama_bad == 2:
+                    notify("AI model service down", "Ollama isn't answering, so tasks, chat and the job search will fail. Try: sudo systemctl restart ollama", tag="health")
+            if HEARTBEAT_URL_RE.match(HEARTBEAT_URL) and now_ts - last_ping >= 60:
+                last_ping = now_ts
+                try:
+                    urllib.request.urlopen(HEARTBEAT_URL, timeout=10).close()
+                except Exception:
+                    pass  # the watchdog notices the missing pings itself
+        except Exception as e:
+            print(f"health check error: {e}", flush=True)
+        time.sleep(HEALTH_EVERY)
+
+
+threading.Thread(target=health_loop, daemon=True).start()
 
 
 # ---------- HTTP ----------
@@ -594,6 +785,8 @@ def get_state(request: Request, since: int = 0):
             "status": state["status"],
             "task": state["task"],
             "pending": state["pending"],
+            "power": {"ac": health["ac"], "battery": health["battery"], "minutes": health["minutes"]},
+            "heat": {"temp": heat["temp"], "hot": heat["hot"], "until": heat["until"] if time.time() < heat["until"] else 0},
             "events": [e for e in state["events"] if e["n"] > since],
         }
 
@@ -604,6 +797,7 @@ def start_task(body: TaskIn, request: Request):
     the agent user, through the tool runner) and listed in the task text, so the model
     can read them with its tools."""
     check_user(request)
+    refuse_if_cooling()
     task = body.task.strip()
     if not task and not body.files:
         raise HTTPException(400, "Empty task")
@@ -653,6 +847,34 @@ def stop(request: Request):
     return {"ok": True}
 
 
+def refuse_if_cooling():
+    if cooling():
+        why = (f"The server is cooling down until {local_time(heat['until'])}" if time.time() < heat["until"]
+               else f"The server is cooling down ({heat['temp']:.0f}°C); it carries on below {COOL_C}°C")
+        raise HTTPException(409, why + ". Resume it on Home to go on now.")
+
+
+class CooldownIn(BaseModel):
+    minutes: int = 60
+
+
+@app.post("/api/cooldown")
+def cooldown(body: CooldownIn, request: Request):
+    """Give the CPU a rest: stop the running task, unload the model, and keep the job search
+    and new tasks off it for a while (0 minutes resumes now). The search waits where it is."""
+    check_user(request)
+    minutes = max(0, min(body.minutes, 24 * 60))
+    heat["until"] = time.time() + minutes * 60 if minutes else 0.0
+    if minutes:
+        stop_requested.set()
+        threading.Thread(target=unload_models, daemon=True).start()
+        print(f"heat: cool down for {minutes} min from the panel", flush=True)
+    else:
+        heat["hot"] = False  # Sai's call: go on now
+        print("heat: resumed from the panel", flush=True)
+    return {"ok": True, "until": heat["until"]}
+
+
 JOB_STATUSES = ("new", "approved", "applied", "interview", "offer", "rejected", "withdrew", "skipped")
 
 
@@ -670,7 +892,7 @@ def jobs_cache_key():
     files = [jobs.DB_FILE, jobs.INBOX_FILE, jobs.MAIL_FILE, jobs.JOBS_DIR / "profile.json", jobs.JOBS_DIR / "config.json",
              jobs.RESUME_JSON, jobs.JOBS_DIR / "resume.txt"]
     stamps = tuple(f.stat().st_mtime_ns if f.exists() else 0 for f in files)
-    return stamps, json.dumps(jobs.progress, sort_keys=True, default=str), datetime.now(timezone.utc).date().isoformat()
+    return stamps, json.dumps([jobs.progress, jobs.adding], sort_keys=True, default=str), datetime.now(timezone.utc).date().isoformat()
 
 
 @app.get("/api/jobs")
@@ -708,7 +930,7 @@ def jobs_run(request: Request):
         raise HTTPException(409, "Job search isn't set up yet")
     if jobs.progress["running"]:
         raise HTTPException(409, "A job search is already running")
-    threading.Thread(target=jobs.run, args=(panel_busy,), daemon=True).start()
+    threading.Thread(target=jobs.run, args=(panel_busy,), kwargs={"manual": True}, daemon=True).start()
     return {"ok": True}
 
 
@@ -740,6 +962,54 @@ def jobs_approve(body: ApproveIn, request: Request):
     if missing:
         raise HTTPException(400, "Answer these first: " + "; ".join(missing))
     return {"ok": True}
+
+
+class AddJobIn(BaseModel):
+    url: str
+    text: str = ""
+    company: str = ""
+
+
+@app.post("/api/jobs/add")
+def jobs_add(body: AddJobIn, request: Request):
+    """Add a job by its link (and a pasted description for boards that can't be read):
+    the agent reads, scores and prepares it in the background like a nightly find."""
+    check_user(request)
+    url = body.url.strip()
+    if not re.match(r"^https://[^\s/]+\.[^\s/]+", url) or len(url) > 2000:
+        raise HTTPException(400, "Paste the job's full https:// link.")
+    if len(body.text) > 60_000:
+        raise HTTPException(400, "The pasted description is too long.")
+    if jobs.adding.get(url, {}).get("state") in ("reading", "scoring", "preparing"):
+        raise HTTPException(409, "That job is already being added.")
+    jobs.adding[url] = {"url": url, "state": "reading", "msg": "Starting", "id": "", "at": jobs.stamp()}
+    threading.Thread(target=jobs.add_job, args=(url, body.text, panel_busy, body.company), daemon=True).start()
+    return {"ok": True}
+
+
+class OutreachIn(BaseModel):
+    id: str
+    kind: str
+    done: bool = True
+
+
+@app.post("/api/jobs/outreach")
+def jobs_outreach(body: OutreachIn, request: Request):
+    """Mark that Sai contacted (or un-mark) one kind of person about a job."""
+    check_user(request)
+    try:
+        if not jobs.set_outreach(body.id, body.kind, body.done):
+            raise HTTPException(404, "No such job")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+@app.get("/api/explore")
+def explore_view(request: Request):
+    """Openings and portals near Albany, in New York State, and at visa-sponsoring employers."""
+    check_user(request)
+    return fast(request, jobs.explore())
 
 
 @app.get("/api/jobs/next")
@@ -912,6 +1182,48 @@ def jobs_ready(request: Request):
     return {"ok": True}
 
 
+@app.get("/api/auto")
+def auto_get(request: Request):
+    """Auto mode: its settings, how well it knows Sai's choices, and today's to-do list."""
+    check_user(request)
+    return jobs.auto_summary()
+
+
+class AutoIn(BaseModel):
+    on: bool | None = None
+    skip: bool | None = None
+    report_at: str | None = None
+
+
+def auto_start():
+    """Turning Auto mode on: learn from the decisions so far and skip right away."""
+    try:
+        jobs.train_prefs()
+        jobs.auto_triage()
+    except Exception as e:
+        print(f"auto mode error: {e}", flush=True)
+
+
+@app.put("/api/auto")
+def auto_save(body: AutoIn, request: Request):
+    check_user(request)
+    try:
+        st = jobs.save_auto(body.on, body.skip, body.report_at)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if st["on"] and (body.on or body.skip):
+        threading.Thread(target=auto_start, daemon=True).start()
+    return st
+
+
+@app.post("/api/auto/report")
+def auto_report_now(request: Request):
+    """Send the to-do list now instead of at the report time."""
+    check_user(request)
+    threading.Thread(target=jobs.auto_report, args=(notify,), daemon=True).start()
+    return {"ok": True}
+
+
 @app.get("/api/jobs/rules")
 def jobs_rules(request: Request):
     check_user(request)
@@ -1062,8 +1374,74 @@ def fill_script(request: Request):
         raise HTTPException(400, "Bad host")
     local = host.split(":")[0] in ("localhost", "127.0.0.1")
     panel = f"{'http' if local else 'https'}://{host}"
-    script = FILL_SCRIPT.replace("__PANEL__", panel).replace("__HOST__", host.split(":")[0])
+    script = FILL_SCRIPT.replace("__PANEL__", panel).replace("__HOST__", host.split(":")[0]).replace("__VERSION__", FILL_VERSION)
     return Response(script, media_type="text/javascript", headers={"Cache-Control": "no-cache"})
+
+
+# While the autofill sends approved applications it reports each step here, and reads the
+# panel's Pause, Resume, Skip and Stop. In memory only: a restart forgets a run. Commands
+# are told apart by their time, so one is acted on once. Stop is also a halt that lasts
+# until the panel starts a run again: every autofill page checks it before filling,
+# sending or opening the next job, so a Stop pressed while the next job's page is loading
+# (when no page is listening) still holds (2026-10-03).
+AUTOFILL = {"live": None, "cmd": "", "cmd_at": "", "halt": False}
+AUTOFILL_STEPS = ("filling", "ready", "paused", "sending", "waiting", "captcha", "needs_you", "sent", "next", "stopped", "done")
+AUTOFILL_FRESH = 90  # seconds without a report before the panel stops showing a run
+
+
+@app.get("/api/autofill")
+def autofill_get(request: Request):
+    """The autofill script's current version (the installed script tells the panel its own,
+    so the panel can offer an update), the run in progress, and the last command."""
+    check_user(request)
+    live = AUTOFILL["live"]
+    if live and time.time() - live["t"] > AUTOFILL_FRESH:
+        live = None
+    return {"version": FILL_VERSION, "live": {k: v for k, v in live.items() if k != "t"} if live else None,
+            "cmd": AUTOFILL["cmd"], "cmd_at": AUTOFILL["cmd_at"], "halt": AUTOFILL["halt"]}
+
+
+class AutofillStateIn(BaseModel):
+    job_id: str = ""
+    company: str = ""
+    title: str = ""
+    step: str
+    left: int = 0
+    note: str = ""
+
+
+@app.post("/api/autofill/state")
+def autofill_state(body: AutofillStateIn, request: Request):
+    check_user(request)
+    if body.step not in AUTOFILL_STEPS:
+        raise HTTPException(400, "Unknown step")
+    AUTOFILL["live"] = {"job_id": body.job_id[:300], "company": body.company[:120], "title": body.title[:200],
+                        "step": body.step, "left": max(0, min(body.left, 999)), "note": body.note[:200],
+                        "at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "t": time.time()}
+    return {"ok": True}
+
+
+class AutofillCmdIn(BaseModel):
+    cmd: str
+
+
+@app.post("/api/autofill/command")
+def autofill_command(body: AutofillCmdIn, request: Request):
+    """Pause, resume, skip (this job waits for later; the run goes on) or stop the run,
+    from the panel or a phone; start clears a stop (the panel's Apply buttons send it)."""
+    check_user(request)
+    if body.cmd not in ("pause", "resume", "skip", "stop", "start"):
+        raise HTTPException(400, "Command must be pause, resume, skip, stop or start")
+    if body.cmd == "start":
+        AUTOFILL.update(halt=False, live=None)
+        return {"ok": True}
+    AUTOFILL.update(cmd=body.cmd, cmd_at=datetime.now(timezone.utc).isoformat(timespec="microseconds"))
+    if body.cmd == "stop":
+        AUTOFILL["halt"] = True
+        if AUTOFILL["live"]:  # shown as stopped now, even if no page is listening
+            AUTOFILL["live"].update(step="stopped", note="Stopped from the panel", t=time.time(),
+                                    at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    return {"ok": True}
 
 
 class ChatIn(BaseModel):
@@ -1133,6 +1511,7 @@ def chat_send(body: ChatIn, request: Request):
     """Add Sai's message and stream the reply as plain text. The chat id comes back
     in the X-Chat-Id header, so the first message of a new chat can create it."""
     check_user(request)
+    refuse_if_cooling()
     text = body.message.strip()
     if not text and not body.files:
         raise HTTPException(400, "Empty message")
@@ -3613,13 +3992,14 @@ setupAlerts();
 FILL_SCRIPT = r"""// ==UserScript==
 // @name         Agent application autofill
 // @namespace    local-agent
-// @version      15
+// @version      18
 // @description  Fills job application forms from the agent panel, and submits the ones you approved there.
 // @match        https://job-boards.greenhouse.io/*
 // @match        https://boards.greenhouse.io/*
 // @match        https://jobs.lever.co/*
 // @match        https://jobs.ashbyhq.com/*
 // @match        https://*.myworkdayjobs.com/*
+// @match        *://__HOST__/*
 // @grant        GM.xmlHttpRequest
 // @grant        GM_xmlhttpRequest
 // @connect      __HOST__
@@ -3629,6 +4009,11 @@ FILL_SCRIPT = r"""// ==UserScript==
 (function () {
   "use strict";
   const PANEL = "__PANEL__";
+  if (location.origin === PANEL) {  // the panel itself: say which version is installed, and nothing else
+    document.documentElement.dataset.autofill = "__VERSION__";
+    window.dispatchEvent(new Event("agent-autofill"));
+    return;
+  }
   const KIND = {legal: "Read and answer yourself", eeo: "Voluntary, your choice", you: "Answer yourself",
                 file: "Attach the file yourself", draft: "No draft for this one, answer yourself"};
   const COLORS = {filled: "#2f9e62", review: "#2f6fd6", you: "#e08a1e"};
@@ -3640,7 +4025,8 @@ FILL_SCRIPT = r"""// ==UserScript==
     set: (k, v) => { try { sessionStorage.setItem(k, v); } catch (e) {} },
     del: k => { try { sessionStorage.removeItem(k); } catch (e) {} },
   };
-  if (location.hash.includes("agent-auto")) store.set(AUTO_KEY, "1");
+  if (location.hash.includes("agent-auto-check")) store.set(AUTO_KEY, "check");
+  else if (location.hash.includes("agent-auto") && !store.get(AUTO_KEY)) store.set(AUTO_KEY, "1");
   let stopped = false;
   const gmx = (typeof GM !== "undefined" && GM.xmlHttpRequest) ? GM.xmlHttpRequest.bind(GM)
             : (typeof GM_xmlhttpRequest !== "undefined" ? GM_xmlhttpRequest : null);
@@ -4193,8 +4579,8 @@ FILL_SCRIPT = r"""// ==UserScript==
     }
     const res = await run();
     if (left.length) body.append(row(node("div", "Fill these in My Experience yourself:", "font-weight:600")),
-      ...left.slice(0, 8).map(q => row(node("div", q, "color:#e08a1e"))));
-    if (notes.length) body.append(...notes.map(q => row(node("div", q, "color:#9b9992"))));
+      ...left.slice(0, 8).map(q => row(node("div", q, "color:#ffb547"))));
+    if (notes.length) body.append(...notes.map(q => row(node("div", q, "color:#6f8cab"))));
     return res;
   }
   const wdNext = () => wdq("pageFooterNextButton") || wdq("bottom-navigation-next-button");
@@ -4289,30 +4675,34 @@ FILL_SCRIPT = r"""// ==UserScript==
     if (!res || !res.job) return;
     if (document.querySelector('[data-automation-id="file-upload-input-ref"]')) await sleep(4000);  // Workday reads the resume
     if (!auto) return;
-    if (!res.approved) return body.append(row(node("div", "Not approved in the panel, so it won't be submitted. Review it in the Jobs tab.", "color:#e08a1e")));
+    if (!res.approved) return body.append(row(node("div", "Not approved in the panel, so it won't be submitted. Review it in the Jobs tab.", "color:#ffb547")));
     if (!wdCreds) { try { wdCreds = await api("GET", "/api/workday/login?tenant=" + encodeURIComponent(wdTenant())); } catch (e) {} }
     if (wdCreds && wdCreds.accept_terms) wdTerms();
     await sleep(1200);
+    if (!run$.job || run$.job.id !== res.job.id) await startRun(res.job);
+    if (await halted()) return;
     const missing = wdMissing();
     if (missing.length) {
+      report("needs_you", missing.length + (missing.length === 1 ? " field" : " fields") + " to fill on Workday");
       body.replaceChildren(row(node("div", "Fill these, then tap Save and Continue (it carries on from the next page):", "font-weight:600")),
-        ...missing.slice(0, 8).map(q => row(node("div", q, "color:#e08a1e"))), laterButton(res.job), stopButton());
+        ...missing.slice(0, 8).map(q => row(node("div", q, "color:#ffb547"))), laterButton(res.job), stopButton());
       return;
     }
     const next = wdNext();
     if (/submit/i.test(clean(next.innerText))) {  // the Review page
-      for (let s = 3; s > 0 && !stopped; s--) {
-        body.replaceChildren(row(node("div", "Submitting " + res.job.company + ": " + res.job.title + " in " + s + "...", "font-weight:600")), stopButton("Stop"));
-        await sleep(1000);
-      }
-      if (stopped) return;
+      const choice = await decide(res.job);
+      if (choice !== "send") return apply$(choice, res.job);
+      if (await halted()) return;
+      report("sending");
       store.set(SENT_KEY, JSON.stringify({id: res.job.id, company: res.job.company, title: res.job.title, at: Date.now()}));
       await snapshot(res);
-      next.click();
+      (wdNext() || next).click();
       body.replaceChildren(row(node("div", "Submitted, waiting for " + res.job.company + " to confirm...")), stopButton());
       return watch(res.job);
     }
+    if (await halted()) return;
     say("Page done: " + clean((wdq("progressBarActiveStep") || next).innerText) + ". Going on...");
+    report("filling", "Workday: " + clean((wdq("progressBarActiveStep") || next).innerText));
     next.click();
   }
   // After Submit (the script's or Sai's own tap): Workday leaves the application flow for
@@ -4401,8 +4791,10 @@ FILL_SCRIPT = r"""// ==UserScript==
     if (style) e.style.cssText = style;
     return e;
   }
-  const BTN = "font:600 14px -apple-system,system-ui,sans-serif;border:0;border-radius:8px;padding:9px 12px;cursor:pointer;";
-  const SHADOW = "z-index:2147483647;box-shadow:0 6px 24px rgba(0,0,0,.35);font:14px/1.4 -apple-system,system-ui,sans-serif;";
+  // the agent panel's look: navy, thin blue lines, monospace, uppercase buttons
+  const MONO = 'ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace';
+  const BTN = "font:600 11px " + MONO + ";letter-spacing:.1em;text-transform:uppercase;border:1px solid rgba(77,180,255,.42);border-radius:2px;padding:9px 10px;cursor:pointer;";
+  const SHADOW = "z-index:2147483647;box-shadow:0 0 0 1px rgba(77,180,255,.42),0 0 24px rgba(77,180,255,.18),0 8px 28px rgba(0,0,0,.5);font:13px/1.45 " + MONO + ";";
 
   // Minimized, the panel is a small round button in the corner, so it never
   // covers the form. The choice is remembered for the site.
@@ -4413,18 +4805,22 @@ FILL_SCRIPT = r"""// ==UserScript==
   }
 
   function ui() {
-    box = node("div", undefined, SHADOW + "position:fixed;right:12px;bottom:12px;width:min(340px,calc(100vw - 24px));background:#1f1e1c;color:#ebeae4;border-radius:12px;padding:10px");
+    box = node("div", undefined, SHADOW + "position:fixed;right:12px;bottom:12px;width:min(360px,calc(100vw - 24px));background:#050b16;color:#cfe6ff;border-radius:2px;padding:10px 12px 12px");
+    const title = node("div", undefined, "display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;font-size:11px;letter-spacing:.24em;color:#6f8cab");
+    const brand = node("span"); brand.append(node("b", "JOB", "color:#7fd0ff;font-weight:700"), node("span", " // ", "color:#4db4ff"), node("b", "AGENT", "color:#7fd0ff;font-weight:700"));
+    title.append(brand, node("span", "AUTOFILL"));
+    box.append(title);
     const row = node("div", undefined, "display:flex;gap:8px");
-    const go = node("button", "Fill from agent", BTN + "background:#57a37a;color:#fff;flex:1");
+    const go = node("button", "Fill from agent", BTN + "background:#126b52;color:#fff;flex:1");
     go.onclick = () => { go.disabled = true; (WD ? wdFillPage() : run()).finally(() => { go.disabled = false; go.textContent = "Fill again"; }); };
-    const min = node("button", "\u2013", BTN + "background:#33322e;color:#ebeae4;width:40px");
+    const min = node("button", "\u2013", BTN + "background:#10223b;color:#cfe6ff;width:40px");
     min.title = "Minimize";
     min.setAttribute("aria-label", "Minimize");
     min.onclick = () => minimize(true);
     row.append(go, min);
     body = node("div", undefined, "max-height:45vh;overflow:auto");
     box.append(row, body);
-    pill = node("button", "Agent", SHADOW + BTN + "position:fixed;right:12px;bottom:12px;background:#57a37a;color:#fff;border-radius:22px;padding:10px 14px;display:none");
+    pill = node("button", "Agent", SHADOW + BTN + "position:fixed;right:12px;bottom:12px;background:#050b16;color:#7fd0ff;padding:10px 14px;display:none");
     pill.setAttribute("aria-label", "Show the autofill panel");
     pill.onclick = () => minimize(false);
     // in a shadow root, so the page's styles can't squash or restyle the panel
@@ -4474,10 +4870,10 @@ FILL_SCRIPT = r"""// ==UserScript==
     const out = [node("div", (res.job ? res.job.company + ": " + res.job.title : "Not a job from the agent; filled from your profile.") , "margin-top:8px;font-weight:600"),
                  node("div", counts.filled + " filled (green), " + counts.review + " drafts to review (blue), " + counts.you + " for you (orange). Check everything, solve the CAPTCHA and submit yourself.", "margin-top:4px")];
     for (const [q, what, text] of todo) {
-      const row = node("div", undefined, "margin-top:8px;border-top:1px solid #33322e;padding-top:6px");
-      row.append(node("div", q, "font-weight:600"), node("div", what, "color:#9b9992"));
+      const row = node("div", undefined, "margin-top:8px;border-top:1px solid #10223b;padding-top:6px");
+      row.append(node("div", q, "font-weight:600"), node("div", what, "color:#6f8cab"));
       if (text) {
-        const copy = node("button", "Copy text", BTN + "background:#33322e;color:#ebeae4;margin-top:4px");
+        const copy = node("button", "Copy text", BTN + "background:#10223b;color:#cfe6ff;margin-top:4px");
         copy.onclick = () => navigator.clipboard.writeText(text).then(() => { copy.textContent = "Copied"; });
         row.append(copy);
       }
@@ -4487,7 +4883,7 @@ FILL_SCRIPT = r"""// ==UserScript==
     lastRes = res;
     watchSubmit(res);
     if (res.job) {
-      const done = node("button", "Mark applied in the panel", BTN + "background:#2f6fd6;color:#fff;margin-top:10px;width:100%");
+      const done = node("button", "Mark applied in the panel", BTN + "background:#1b5594;color:#fff;margin-top:10px;width:100%");
       done.onclick = () => snapshot(res).then(() => api("POST", "/api/jobs/status", {id: res.job.id, status: "applied"}))
         .then(() => { done.textContent = "Marked applied"; done.disabled = true; }, e => { done.textContent = e.message; });
       out.push(done);
@@ -4573,31 +4969,156 @@ FILL_SCRIPT = r"""// ==UserScript==
 
   function row(...nodes) { const d = node("div", undefined, "margin-top:8px"); d.append(...nodes); return d; }
   function stopButton(label) {
-    const b = node("button", label || "Stop applying", BTN + "background:#a3392b;color:#fff;margin-top:8px;width:100%");
-    b.onclick = () => { stopped = true; store.del(AUTO_KEY); store.del(SENT_KEY); say("Stopped. Approved applications stay approved; open Apply to approved in the panel to go on."); };
+    const b = node("button", label || "Stop applying", BTN + "background:#7c1f2c;color:#fff;margin-top:8px;width:100%");
+    b.onclick = stopAll;
     return b;
+  }
+
+  // ---------- controls while sending approved applications ----------
+  // Before each Submit: a countdown with Send now, Pause, Skip for now, Won't apply and
+  // Stop all, and how many are left. "Check each one before it's sent" pauses every time
+  // (the choice rides along in the next job's link). Esc pauses. Each step is reported to
+  // the panel, which can pause, resume or stop the run, from a phone too; a command is
+  // acted on once, told apart by its time, and ones from before this page are ignored.
+  const COUNTDOWN = 5;
+  const mode = () => store.get(AUTO_KEY) === "check" ? "check" : "auto";
+  const run$ = {left: 0, job: null, step: "", note: "", seen: null, beat: 0};
+  async function startRun(job) {
+    run$.job = job;
+    try { const r = await api("GET", "/api/autofill"); run$.seen = r.cmd_at || ""; } catch (e) { run$.seen = ""; }
+    try { const n = await api("GET", "/api/jobs/next"); run$.left = n.left || 0; } catch (e) {}
+  }
+  function report(step, note) {
+    run$.step = step; run$.note = note || ""; run$.beat = Date.now();
+    const j = run$.job || {};
+    api("POST", "/api/autofill/state", {job_id: j.id || "", company: j.company || "", title: j.title || "", step, left: run$.left, note: run$.note}).catch(() => {});
+  }
+  async function command() {  // the panel's newest command, if it came after this page started; a halt always counts
+    if (Date.now() - run$.beat > 20000 && run$.step) report(run$.step, run$.note);  // keeps the panel's view fresh
+    try {
+      const r = await api("GET", "/api/autofill");
+      if (r.halt) return "stop";
+      if (run$.seen !== null && r.cmd_at && r.cmd_at !== run$.seen) { run$.seen = r.cmd_at; return r.cmd; }
+    } catch (e) {}
+    return null;
+  }
+  // Stop pressed in the panel, even while no page was listening: nothing more is filled, sent or opened.
+  async function halted() {
+    try { if ((await api("GET", "/api/autofill")).halt) { stopAll("Stopped from the panel."); return true; } } catch (e) {}
+    return false;
+  }
+  function progressLine() {
+    const j = run$.job;
+    return node("div", (run$.left ? run$.left + (run$.left === 1 ? " approved application left" : " approved applications left") + ", this one included" : "Sending approved applications")
+      + (j ? " \u00b7 " + j.company : ""), "color:#6f8cab;font-size:12px");
+  }
+  function modeBox() {
+    const l = node("label", undefined, "display:flex;gap:8px;align-items:center;margin-top:10px;color:#6f8cab;font-size:13px;cursor:pointer");
+    const c = node("input"); c.type = "checkbox"; c.checked = mode() === "check";
+    c.onchange = () => { store.set(AUTO_KEY, c.checked ? "check" : "1"); if (c.checked) { paused = true; decide.redraw && decide.redraw(); } };
+    l.append(c, node("span", "Check each one before it's sent"));
+    return l;
+  }
+  let paused = false;
+  // Waits for what to do with this filled form: "send", "later", "drop" or "stop".
+  function decide(job) {
+    return new Promise(resolve => {
+      let left = COUNTDOWN, done = false, ticks = 0;
+      paused = mode() === "check";
+      report(paused ? "paused" : "ready");
+      const finish = c => {
+        if (done) return;
+        done = true; clearInterval(timer); document.removeEventListener("keydown", esc, true); decide.redraw = null;
+        pill.textContent = "Agent";
+        resolve(c);
+      };
+      const pause = on => { paused = on; if (!on) left = COUNTDOWN; report(on ? "paused" : "ready"); draw(); };
+      const esc = e => { if (e.key === "Escape" && !paused) { e.preventDefault(); pause(true); } };
+      document.addEventListener("keydown", esc, true);
+      const b = (text, bg, fg, fn) => { const x = node("button", text, BTN + "background:" + bg + ";color:" + fg + ";flex:1"); x.onclick = fn; return x; };
+      function draw() {
+        const head = paused ? "Paused. Check " + job.company + "'s form, then send it." : "Sending " + job.company + ": " + job.title + " in " + left + "...";
+        const r1 = node("div", undefined, "display:flex;gap:8px;margin-top:10px"), r2 = node("div", undefined, "display:flex;gap:8px;margin-top:8px");
+        r1.append(b("Send now", "#1b5594", "#fff", () => finish("send")),
+                  paused ? (mode() === "check" ? b("Skip for now", "#10223b", "#cfe6ff", () => finish("later")) : b("Resume", "#126b52", "#fff", () => pause(false)))
+                         : b("Pause", "#ffb547", "#050b16", () => pause(true)));
+        r2.append(...(paused && mode() === "check" ? [] : [b("Skip for now", "#10223b", "#cfe6ff", () => finish("later"))]),
+                  b("Won't apply", "#10223b", "#cfe6ff", () => finish("drop")), b("Stop all", "#7c1f2c", "#fff", () => finish("stop")));
+        body.replaceChildren(progressLine(), row(node("div", head, "font-weight:600")), r1, r2, modeBox(),
+          node("div", paused ? "Esc pauses. Nothing is sent until you choose." : "Esc pauses.", "color:#4a6585;font-size:12px;margin-top:6px"));
+        pill.textContent = paused ? "Agent \u00b7 paused" : "Agent \u00b7 " + left;
+      }
+      decide.redraw = draw;
+      draw();
+      minimize(false);
+      const timer = setInterval(async () => {
+        if (done) return;
+        if (++ticks % 2 === 0) {
+          const c = await command();
+          if (c === "stop") return finish("stop");
+          if (c === "skip") return finish("later");
+          if (c === "pause" && !paused) pause(true);
+          if (c === "resume" && paused) { if (mode() === "check") store.set(AUTO_KEY, "1"); pause(false); }
+        }
+        if (done || paused) return;
+        if (--left <= 0) return finish("send");
+        draw();
+      }, 1000);
+    });
+  }
+  // What a choice other than "send" does. Returns once the run has moved on or stopped.
+  async function apply$(choice, job) {
+    if (choice === "stop") return stopAll();
+    stopped = true; store.del(SENT_KEY);
+    if (choice === "later") await api("POST", "/api/jobs/defer", {id: job.id}).catch(() => {});
+    if (choice === "drop") {
+      try { await api("POST", "/api/jobs/status", {id: job.id, status: "skipped"}); }
+      catch (e) { return say("Couldn't mark it skipped: " + e.message); }
+    }
+    run$.left = Math.max(0, run$.left - 1);
+    report("next", choice === "later" ? "Skipped " + job.company + " for later" : "Won't apply to " + job.company);
+    goNext();
+  }
+  function stopAll(why) {
+    stopped = true; store.del(AUTO_KEY); store.del(SENT_KEY);
+    report("stopped", typeof why === "string" ? why : "");
+    say((typeof why === "string" ? why + " " : "Stopped. ") + "Approved applications stay approved; open Apply to approved in the panel to go on.");
+  }
+  // While Sai fixes a form or solves a CAPTCHA, the panel's Skip and Stop still work.
+  async function watchCommands(job) {
+    const c = await command();
+    if (c === "stop") stopAll();
+    if (c === "skip" && job) apply$("later", job);
   }
 
   // After Submit: wait for the confirmation (this page or the next one), then move on.
   async function watch(job) {
+    if (!run$.job) await startRun(job);
+    report("waiting");
     for (let t = 0; t < 240 && !stopped; t++) {  // 2 minutes, then a CAPTCHA may still be open
       if (succeeded()) return finished(job);
-      if (challengeOpen()) body.replaceChildren(row(node("div", "Solve the CAPTCHA for " + job.company + ". It goes on by itself after that.")), stopButton());
+      if (challengeOpen()) {
+        if (run$.step !== "captcha") report("captcha", "Solve the CAPTCHA on the form");
+        body.replaceChildren(row(node("div", "Solve the CAPTCHA for " + job.company + ". It goes on by itself after that.")), stopButton());
+      }
+      if (t % 8 === 7) await watchCommands(job);
       await sleep(500);
     }
     if (stopped) return;
-    const again = node("button", "It went through", BTN + "background:#2f6fd6;color:#fff;margin-top:8px;width:100%");
+    const again = node("button", "It went through", BTN + "background:#1b5594;color:#fff;margin-top:8px;width:100%");
     again.onclick = () => finished(job);
     body.replaceChildren(row(node("div", "No confirmation from " + job.company + " yet. Fix what the form points out and tap its Submit button, or confirm it went through.")), again, laterButton(job), stopButton());
+    report("needs_you", "No confirmation yet: check the form");
     for (let t = 0; t < 1200 && !stopped; t++) {  // keep watching while Sai fixes things
       if (succeeded()) return finished(job);
+      if (t % 8 === 7) await watchCommands(job);
       await sleep(500);
     }
   }
 
   function laterButton(job) {
-    const b = node("button", "Skip for now, next one", BTN + "background:#33322e;color:#ebeae4;margin-top:8px;width:100%");
-    b.onclick = async () => { stopped = true; store.del(SENT_KEY); await api("POST", "/api/jobs/defer", {id: job.id}).catch(() => {}); goNext(); };
+    const b = node("button", "Skip for now, next one", BTN + "background:#10223b;color:#cfe6ff;margin-top:8px;width:100%");
+    b.onclick = () => apply$("later", job);
     return b;
   }
 
@@ -4606,46 +5127,56 @@ FILL_SCRIPT = r"""// ==UserScript==
     finished.id = job.id;
     store.del(SENT_KEY);
     try { await api("POST", "/api/jobs/status", {id: job.id, status: "applied"}); } catch (e) {}
+    run$.left = Math.max(0, run$.left - 1);
+    report("sent");
     say("Submitted: " + job.company + ", " + job.title + ".");
-    if (store.get(AUTO_KEY)) { await sleep(2500); if (!stopped) goNext(); }
+    if (store.get(AUTO_KEY)) { await sleep(2500); if (!stopped && !(await halted())) goNext(); }
   }
 
   async function goNext() {
+    if (await halted()) return;
     let n;
-    try { n = await api("GET", "/api/jobs/next"); } catch (e) { return say(e.message); }
-    if (!n.job) { store.del(AUTO_KEY); return say("All approved applications are done."); }
-    if (!/^https:\/\//.test(n.job.apply_url)) return say("The next job has no application link.");
+    try { n = await api("GET", "/api/jobs/next"); } catch (e) { report("stopped", e.message); return say(e.message); }
+    if (!n.job) { store.del(AUTO_KEY); run$.left = 0; report("done"); return say("All approved applications are done."); }
+    if (!/^https:\/\//.test(n.job.apply_url)) { report("stopped", "The next job has no application link"); return say("The next job has no application link."); }
+    run$.job = n.job; run$.left = n.left;
+    report("next");
     say("Next: " + n.job.company + ", " + n.job.title + " (" + n.left + " left).");
-    location.href = n.job.apply_url + "#agent-auto";
+    location.href = n.job.apply_url + (mode() === "check" ? "#agent-auto-check" : "#agent-auto");
   }
 
   async function autoApply() {
     stopped = false;
+    if (await halted()) return;
     const res = await run();
     if (!res || !res.job) return;
-    if (!res.approved) return body.append(row(node("div", "Not approved in the panel, so it won't be submitted. Review it in the Jobs tab of the panel.", "color:#e08a1e")));
+    if (!res.approved) return body.append(row(node("div", "Not approved in the panel, so it won't be submitted. Review it in the Jobs tab of the panel.", "color:#ffb547")));
+    await startRun(res.job);
+    if (await halted()) return;
     await sleep(1200);  // let the form settle after the last choices
     const missing = missingRequired();
     if (missing.length) {
+      report("needs_you", missing.length + (missing.length === 1 ? " required field" : " required fields") + " to fill");
       body.replaceChildren(row(node("div", "Fill these, then tap the form's Submit button:", "font-weight:600")),
-        ...missing.slice(0, 8).map(q => row(node("div", q, "color:#e08a1e"))), laterButton(res.job), stopButton());
+        ...missing.slice(0, 8).map(q => row(node("div", q, "color:#ffb547"))), laterButton(res.job), stopButton());
       store.set(SENT_KEY, JSON.stringify({id: res.job.id, company: res.job.company, title: res.job.title, at: Date.now()}));
       return watch(res.job);
     }
     const btn = submitButton();
     if (!btn) {
+      report("needs_you", "Couldn't find the Submit button");
       body.replaceChildren(row(node("div", "Couldn't find the Submit button. Tap it yourself.")), laterButton(res.job), stopButton());
       store.set(SENT_KEY, JSON.stringify({id: res.job.id, company: res.job.company, title: res.job.title, at: Date.now()}));
       return watch(res.job);
     }
-    for (let s = 3; s > 0 && !stopped; s--) {
-      body.replaceChildren(row(node("div", "Submitting " + res.job.company + ": " + res.job.title + " in " + s + "...", "font-weight:600")), stopButton("Stop"));
-      await sleep(1000);
-    }
-    if (stopped) return;
+    const choice = await decide(res.job);
+    if (choice !== "send") return apply$(choice, res.job);
+    if (await halted()) return;
+    const now = submitButton() || btn;  // the form may have re-rendered while it waited
+    report("sending");
     store.set(SENT_KEY, JSON.stringify({id: res.job.id, company: res.job.company, title: res.job.title, at: Date.now()}));
     await snapshot(res);
-    btn.click();
+    now.click();
     body.replaceChildren(row(node("div", "Submitted, waiting for " + res.job.company + " to confirm...")), stopButton());
     watch(res.job);
   }
@@ -4684,3 +5215,5 @@ FILL_SCRIPT = r"""// ==UserScript==
   window.__agentFill = {collect, put, mark, attachDoc, run, missingRequired, submitButton};  // for testing from the console
 })();
 """
+FILL_VERSION = re.search(r"@version\s+(\d+)", FILL_SCRIPT).group(1)  # bump @version whenever the script changes
+

@@ -1,0 +1,10 @@
+[Unit]
+Description=Check the CPU burst power cap every minute
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

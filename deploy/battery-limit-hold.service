@@ -1,0 +1,13 @@
+[Unit]
+Description=Pause battery charging while the server is off
+# Started at boot and does nothing then; stopping it at shutdown or reboot runs
+# "battery-limit hold", which turns conservation mode on (see battery-limit.sh).
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/local/sbin/battery-limit hold
+
+[Install]
+WantedBy=multi-user.target

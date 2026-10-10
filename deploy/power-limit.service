@@ -1,0 +1,6 @@
+[Unit]
+Description=Cap the CPU's turbo bursts at 25 W so it doesn't spike to 95°C
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/power-limit

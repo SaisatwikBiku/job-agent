@@ -13,6 +13,12 @@
    "url": "https://www.linkedin.com/in/you"
   }
  ],
+ "badges": [
+  {
+   "file": "certificate-badge.png",
+   "height": 50
+  }
+ ],
  "summary": "Two or three sentences about you. The agent rewrites this per job from what's below.",
  "skills": [
   {
@@ -35,7 +41,7 @@
    "name": "Project name",
    "subtitle": "What it is (stack)",
    "bullets": [
-    "What you did and how. Bullets are used word for word."
+    "What you did and how. Bullets are used word for word (reword_bullets in config.json lets the model adjust their wording, checked in code)."
    ]
   },
   {
